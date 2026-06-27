@@ -1,4 +1,4 @@
-"""
+﻿"""
 ========================================
 server.py — MCP 服务入口 + 启动装配
 ========================================
@@ -642,10 +642,10 @@ async def trace(
     status: Optional[str] = "",
     weight: Optional[float] = -1,
     dont_surface: Optional[int] = -1,
-    why_remembered: Optional[str] = “”,
-    merge: Optional[str] = “”,
+    why_remembered: Optional[str] = "",
+    merge: Optional[str] = "",
 ) -> str:
-    “””我修正/更新某条记忆的元数据或内容。bucket_id 支持逗号分隔多个ID批量操作(批量时content/name忽略)。resolved=1=放下;pinned=1=钉为永久核心;digested=1=已消化;content=替换正文并重建embedding;delete=True=彻底删除;merge=另一个bucket_id=将其内容追加进来并删除源桶(不能对钉选桶操作);dont_surface=1=主动遗忘。只传要改的字段,-1或空串不改。”””
+    """我修正/更新某条记忆的元数据或内容。bucket_id 支持逗号分隔多个ID批量操作(批量时content/name忽略)。resolved=1=放下;pinned=1=钉为永久核心;digested=1=已消化;content=替换正文并重建embedding;delete=True=彻底删除;merge=另一个bucket_id=将其内容追加进来并删除源桶(不能对钉选桶操作);dont_surface=1=主动遗忘。只传要改的字段,-1或空串不改。"""
     return await _with_notice(
         _t_trace.dispatch(
             bucket_id=bucket_id, name=name, domain=domain,
@@ -655,14 +655,14 @@ async def trace(
             dont_surface=dont_surface, why_remembered=why_remembered,
             merge=merge,
         ),
-        op=”trace”,
+        op="trace",
         args={
-            “bucket_id”: bucket_id, “name”: name, “domain”: domain,
-            “valence”: valence, “arousal”: arousal, “importance”: importance,
-            “tags”: tags, “resolved”: resolved, “pinned”: pinned, “digested”: digested,
-            “content_len”: len(content or “”), “delete”: delete, “status”: status,
-            “weight”: weight, “dont_surface”: dont_surface,
-            “why_len”: len(why_remembered or “”), “merge”: merge,
+            "bucket_id": bucket_id, "name": name, "domain": domain,
+            "valence": valence, "arousal": arousal, "importance": importance,
+            "tags": tags, "resolved": resolved, "pinned": pinned, "digested": digested,
+            "content_len": len(content or ""), "delete": delete, "status": status,
+            "weight": weight, "dont_surface": dont_surface,
+            "why_len": len(why_remembered or ""), "merge": merge,
         },
     )
 
