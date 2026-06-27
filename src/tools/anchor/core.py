@@ -53,9 +53,11 @@ async def anchor_release(bucket_id: str) -> str:
     return f"我把它从 anchor 移开了。它会重新参与默认浮现。当前 {result['count']}/{result['limit']}。"
 
 
-async def pulse(include_archive: Optional[bool] = False) -> str:
+async def pulse(include_archive: Optional[bool] = False, show_all: Optional[bool] = False) -> str:
     if include_archive is None:
         include_archive = False
+    if show_all is None:
+        show_all = False
     await rt.decay_engine.ensure_started()
     try:
         stats = await rt.bucket_mgr.get_stats()
@@ -101,6 +103,24 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
 
     if not buckets:
         return status + "\n记忆库为空。"
+
+    # B2: show_all=False 时只显示钉选桶 + 按权重排序的前 15 个普通桶
+    # E5: 默认隐藏 dormant 桶
+    if not show_all:
+        pinned_b = [b for b in buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
+        normal_b = [b for b in buckets
+                    if not b["metadata"].get("pinned") and not b["metadata"].get("protected")
+                    and not b["metadata"].get("dormant", False)]
+        normal_b.sort(key=lambda b: rt.decay_engine.calculate_score(b["metadata"]), reverse=True)
+        buckets = pinned_b + normal_b[:15]
+        dormant_hidden = sum(1 for b_orig in (buckets if show_all else [])  # placeholder
+                             for _ in [None] if b_orig["metadata"].get("dormant", False))
+    dormant_total = 0
+    try:
+        all_b_tmp = await rt.bucket_mgr.list_all(include_archive=False)
+        dormant_total = sum(1 for b in all_b_tmp if b["metadata"].get("dormant", False))
+    except Exception:
+        pass
 
     normal_lines: list[str] = []
     feel_lines: list[str] = []
@@ -157,6 +177,10 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
             normal_lines.append(line)
 
     sections = [status]
+    if not show_all and dormant_total > 0:
+        sections[0] += f"休眠桶: {dormant_total} 个（pulse(show_all=True) 可查看全部）\n"
+    if not show_all:
+        sections[0] += "（已按权重显示钉选桶 + 前 15 条，pulse(show_all=True) 查看全部）\n"
     if normal_lines:
         sections.append("=== 记忆列表 ===\n" + "\n".join(normal_lines))
     if plan_lines:

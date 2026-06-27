@@ -554,6 +554,10 @@ class BucketManager:
         if is_pinned:
             kwargs.pop("importance", None)  # silently ignore importance update
 
+        # E5: trace 修改时自动解除 dormant（除非本次调用就是在设置 dormant）
+        if "dormant" not in kwargs and post.get("dormant"):
+            post["dormant"] = False
+
         # --- Update only fields that were passed in / 只改传入的字段 ---
         if "content" in kwargs:
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
@@ -602,13 +606,13 @@ class BucketManager:
                   # 表示「最后一次合并是 hold 还是 grow 触发的」。
                   # _pre_anchor_source_tool 是 anchor 时保存的原始 source_tool，
                   # release 时自动恢复；None 表示删除该字段。
-                  "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool"):
+                  "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool",
+                  # E5: dormant 标记——30天未访问且 importance<3 的桶进入休眠状态
+                  "dormant"):
             if k in kwargs:
                 if k == "weight" and kwargs[k] is not None:
                     post[k] = _clamp01(kwargs[k], _DEFAULT_VALENCE)
-                elif k == "dont_surface":
-                    post[k] = bool(kwargs[k])
-                elif k == "first_of_kind":
+                elif k in ("dont_surface", "first_of_kind", "dormant"):
                     post[k] = bool(kwargs[k])
                 elif k == "anchor":
                     # iter 2.0: anchor 是布尔；False 时直接删除字段保持 frontmatter 干净。
@@ -761,6 +765,9 @@ class BucketManager:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = int(post.get("activation_count") or 0) + 1  # type: ignore[call-overload]
+            # E5: 被命中自动解除 dormant
+            if post.get("dormant"):
+                post["dormant"] = False
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))

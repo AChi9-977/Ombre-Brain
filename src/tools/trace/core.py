@@ -30,6 +30,51 @@ from .. import _runtime as rt
 from .._common import check_content_size, check_pinned_quota
 
 
+async def _merge_buckets(target_id: str, source_id: str) -> str:
+    """E4: 把 source 桶内容追加到 target 桶，然后删除 source 桶。"""
+    target = await rt.bucket_mgr.get(target_id)
+    source = await rt.bucket_mgr.get(source_id)
+    if not target:
+        return f"目标桶未找到: {target_id}"
+    if not source:
+        return f"源桶未找到: {source_id}"
+    if source["metadata"].get("pinned"):
+        return "源桶是钉选桶，不能合并。"
+    if target["metadata"].get("pinned"):
+        return "目标桶是钉选桶，不能合并。"
+
+    # 内容追加
+    merged_content = target["content"].rstrip() + "\n\n---\n\n" + source["content"].strip()
+    # 标签去重
+    t_tags = set(target["metadata"].get("tags") or [])
+    s_tags = set(source["metadata"].get("tags") or [])
+    merged_tags = list(t_tags | s_tags)
+    # importance 取大
+    t_imp = int(target["metadata"].get("importance") or 5)
+    s_imp = int(source["metadata"].get("importance") or 5)
+    merged_imp = max(t_imp, s_imp)
+    # 情感取平均
+    t_val = float(target["metadata"].get("valence") or 0.5)
+    s_val = float(source["metadata"].get("valence") or 0.5)
+    t_aro = float(target["metadata"].get("arousal") or 0.3)
+    s_aro = float(source["metadata"].get("arousal") or 0.3)
+
+    await rt.bucket_mgr.update(
+        target_id,
+        content=merged_content,
+        tags=merged_tags,
+        importance=merged_imp,
+        valence=round((t_val + s_val) / 2, 3),
+        arousal=round((t_aro + s_aro) / 2, 3),
+    )
+    try:
+        await rt.embedding_engine.generate_and_store(target_id, merged_content)
+    except Exception:
+        pass
+    await rt.bucket_mgr.delete(source_id)
+    return f"已将 {source_id} 合并入 {target_id}，源桶已删除。"
+
+
 async def trace_core(
     bucket_id: str,
     name: Optional[str] = "",
@@ -47,6 +92,7 @@ async def trace_core(
     weight: Optional[float] = -1,
     dont_surface: Optional[int] = -1,
     why_remembered: Optional[str] = "",
+    merge: Optional[str] = "",
 ) -> str:
     if name is None: name = ""
     if domain is None: domain = ""
@@ -63,11 +109,30 @@ async def trace_core(
     if weight is None: weight = -1
     if dont_surface is None: dont_surface = -1
     if why_remembered is None: why_remembered = ""
+    if merge is None: merge = ""
     if rt.mark_op:
         rt.mark_op("trace")
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
+
+    # E3: 逗号分隔多 ID 批量模式（content/name 忽略）
+    ids = [s.strip() for s in bucket_id.split(",") if s.strip()]
+    if len(ids) > 1:
+        results = []
+        for bid in ids:
+            r = await trace_core(
+                bucket_id=bid, domain=domain, valence=valence, arousal=arousal,
+                importance=importance, tags=tags, resolved=resolved, pinned=pinned,
+                digested=digested, delete=delete, status=status, weight=weight,
+                dont_surface=dont_surface,
+            )
+            results.append(f"{bid}: {r}")
+        return "\n".join(results)
+
+    # E4: merge — 把 bucket_id 合并进当前桶
+    if merge and merge.strip():
+        return await _merge_buckets(bucket_id.strip(), merge.strip())
 
     # --- Delete 模式（F-10：软删除，移入 archive/ + 标 deleted_at）---
     if delete:

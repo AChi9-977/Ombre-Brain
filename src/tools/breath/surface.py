@@ -26,9 +26,40 @@ tools/breath/surface.py — 无 query 浮现模式
 import random
 import time
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 from .. import _runtime as rt
 from utils import strip_wikilinks, count_tokens_approx
+
+
+def _bucket_summary_line(b: dict, prefix: str = "") -> str:
+    """B1: 摘要模式单行格式。"""
+    meta = b["metadata"]
+    name = meta.get("name") or b["id"]
+    domains = ",".join(meta.get("domain", []) or []) or "未分类"
+    val = float(meta.get("valence") or 0.5)
+    aro = float(meta.get("arousal") or 0.3)
+    imp = meta.get("importance", "?")
+    updated = str(meta.get("last_active") or meta.get("created", ""))[:10]
+    related = meta.get("related") or []
+    rel_str = ""
+    if related:
+        rel_str = f" 关联:[{','.join(related)}]"
+    return f"{prefix}[{b['id']}] 《{name}》 主题:{domains} 情感:V{val:.1f}/A{aro:.1f} 重要:{imp} 更新:{updated}{rel_str}"
+
+
+def _in_date_range(meta: dict, date_from: str, date_to: str) -> bool:
+    """D2: 按更新时间过滤。"""
+    if not date_from and not date_to:
+        return True
+    ts = str(meta.get("last_active") or meta.get("created", ""))[:10]
+    if not ts:
+        return True
+    if date_from and ts < date_from:
+        return False
+    if date_to and ts > date_to:
+        return False
+    return True
 
 # U-07 fix: throttle the sampling-fallback INFO log to once per 5 minutes.
 # 库小且 sampling=ON 时此分支每次 breath 都触发，原本会刷屏；改为 ≥300s
@@ -44,7 +75,15 @@ def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
     return all(t in bucket_tags for t in tag_filter)
 
 
-async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -> str:
+async def surface_default(
+    max_results: int,
+    max_tokens: int,
+    tag_filter: list,
+    mode: str = "summary",
+    date_from: str = "",
+    date_to: str = "",
+    include_dormant: bool = False,
+) -> str:
     try:
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
@@ -86,7 +125,9 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
         and not b["metadata"].get("dont_surface", False)
+        and (include_dormant or not b["metadata"].get("dormant", False))
         and _bucket_has_tags(b["metadata"], tag_filter)
+        and _in_date_range(b["metadata"], date_from, date_to)
     ]
 
     rt.logger.info(
@@ -191,14 +232,26 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         if token_budget <= 0:
             break
         try:
-            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-            summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-            summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
-                break
             score = rt.decay_engine.calculate_score(b["metadata"])
-            dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
-            token_budget -= summary_tokens
+            if mode == "summary":
+                line = _bucket_summary_line(b, prefix=f"[权重:{score:.2f}] ")
+                line_tokens = count_tokens_approx(line)
+                if line_tokens > token_budget:
+                    break
+                dynamic_results.append(line)
+                token_budget -= line_tokens
+            else:
+                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                # D3: 附带关联桶
+                related = b["metadata"].get("related") or []
+                if related:
+                    summary += f"\n关联桶: {', '.join(related)}"
+                summary_tokens = count_tokens_approx(summary)
+                if summary_tokens > token_budget:
+                    break
+                dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                token_budget -= summary_tokens
         except Exception as e:
             rt.logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
             continue

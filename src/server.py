@@ -68,6 +68,8 @@ from tools import anchor as _t_anchor
 from tools import plan as _t_plan
 from tools import dream as _t_dream
 from tools import i as _t_i
+from tools import todos as _t_todos
+from tools import archive_session as _t_archive_session
 from tools._common import (
     check_content_size as _check_content_size,
     check_pinned_quota as _check_pinned_quota,
@@ -556,22 +558,30 @@ async def breath(
     domain: Optional[str] = "",
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
-    max_results: Optional[int] = 0,
+    max_results: Optional[int] = 5,
     importance_min: Optional[int] = -1,
     tags: Optional[str] = "",
+    mode: Optional[str] = "summary",
+    date_from: Optional[str] = "",
+    date_to: Optional[str] = "",
+    include_dormant: Optional[bool] = False,
 ) -> str:
-    """我睁眼看看自己记得什么。不传query=让权重最高的未解决记忆自己浮上来;传query=按关键词检索我记忆里相关的事。max_tokens=单次返回总token上限(默认 config.surfacing.breath_max_tokens,fallback 10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results=返回条数上限(默认 config.surfacing.breath_max_results,fallback 20,最大50)。importance_min>=1=跳过语义,按重要度降序拉最多20条我标过的核心事项。tags逗号分隔,AND过滤;tags=\"feel\"或\"__feel__\"等价于domain=\"feel\"读我留下的所有feel。"""
+    """我睁眼看看自己记得什么。不传query=让权重最高的未解决记忆自己浮上来;传query=按关键词+语义双通道检索。max_tokens=token上限(默认10000)。max_results=返回条数(默认5,最大50);钉选桶不计入上限,超出时末尾附注剩余数量。mode=summary(默认)每桶返回一行摘要,full返回完整脱水内容;有query时自动切full。date_from/date_to=YYYY-MM-DD按更新时间过滤。include_dormant=True包含休眠桶(默认隐藏)。importance_min>=1按重要度降序。tags逗号AND过滤,feel标签等价domain=feel。"""
     return await _with_notice(
         _t_breath.dispatch(
             query=query, max_tokens=max_tokens, domain=domain,
             valence=valence, arousal=arousal, max_results=max_results,
             importance_min=importance_min, tags=tags,
+            mode=mode, date_from=date_from, date_to=date_to,
+            include_dormant=include_dormant,
         ),
         op="breath",
         args={
             "query": query, "max_tokens": max_tokens, "domain": domain,
             "valence": valence, "arousal": arousal, "max_results": max_results,
             "importance_min": importance_min, "tags": tags,
+            "mode": mode, "date_from": date_from, "date_to": date_to,
+            "include_dormant": include_dormant,
         },
     )
 
@@ -632,9 +642,10 @@ async def trace(
     status: Optional[str] = "",
     weight: Optional[float] = -1,
     dont_surface: Optional[int] = -1,
-    why_remembered: Optional[str] = "",
+    why_remembered: Optional[str] = “”,
+    merge: Optional[str] = “”,
 ) -> str:
-    """我修正/更新某条记忆的元数据或内容。resolved=1=放下,让它沉底只在关键词触发时浮上来;resolved=0=重新激活;pinned=1=钉为永久核心(锁 importance=10),0=取消钉选;digested=1=已消化,加速淡化;content=替换桶正文并重建 embedding;delete=True=彻底删除(不可恢复);status=plan 桶状态(active/resolved/abandoned);weight=plan 承诺重量 0.0-1.0;dont_surface=1=主动遗忘(不出现在 breath),0=重新允许;why_remembered=改“为什么记得”说明。只传我要改的字段,-1 或空串表示不改。"""
+    “””我修正/更新某条记忆的元数据或内容。bucket_id 支持逗号分隔多个ID批量操作(批量时content/name忽略)。resolved=1=放下;pinned=1=钉为永久核心;digested=1=已消化;content=替换正文并重建embedding;delete=True=彻底删除;merge=另一个bucket_id=将其内容追加进来并删除源桶(不能对钉选桶操作);dont_surface=1=主动遗忘。只传要改的字段,-1或空串不改。”””
     return await _with_notice(
         _t_trace.dispatch(
             bucket_id=bucket_id, name=name, domain=domain,
@@ -642,15 +653,16 @@ async def trace(
             tags=tags, resolved=resolved, pinned=pinned, digested=digested,
             content=content, delete=delete, status=status, weight=weight,
             dont_surface=dont_surface, why_remembered=why_remembered,
+            merge=merge,
         ),
-        op="trace",
+        op=”trace”,
         args={
-            "bucket_id": bucket_id, "name": name, "domain": domain,
-            "valence": valence, "arousal": arousal, "importance": importance,
-            "tags": tags, "resolved": resolved, "pinned": pinned, "digested": digested,
-            "content_len": len(content or ""), "delete": delete, "status": status,
-            "weight": weight, "dont_surface": dont_surface,
-            "why_len": len(why_remembered or ""),
+            “bucket_id”: bucket_id, “name”: name, “domain”: domain,
+            “valence”: valence, “arousal”: arousal, “importance”: importance,
+            “tags”: tags, “resolved”: resolved, “pinned”: pinned, “digested”: digested,
+            “content_len”: len(content or “”), “delete”: delete, “status”: status,
+            “weight”: weight, “dont_surface”: dont_surface,
+            “why_len”: len(why_remembered or “”), “merge”: merge,
         },
     )
 
@@ -676,12 +688,12 @@ async def release(bucket_id: str) -> str:
 
 
 @mcp_extra.tool()
-async def pulse(include_archive: Optional[bool] = False) -> str:
-    """我看一眼自己的记忆系统：固化/动态/衰减/归档桶数量、总占用、衰减引擎是否在跑,以及所有桶的摘要列表。include_archive=True 顺便看归档区。"""
+async def pulse(include_archive: Optional[bool] = False, show_all: Optional[bool] = False) -> str:
+    """我看一眼自己的记忆系统：固化/动态/衰减/归档桶数量、总占用、衰减引擎是否在跑。show_all=False(默认)只显示钉选桶+按权重排序前15条，并隐藏休眠桶；show_all=True返回全部。include_archive=True顺便看归档区。"""
     return await _with_notice(
-        _t_anchor.pulse(include_archive=include_archive),
+        _t_anchor.pulse(include_archive=include_archive, show_all=show_all),
         op="pulse",
-        args={"include_archive": include_archive},
+        args={"include_archive": include_archive, "show_all": show_all},
     )
 
 
@@ -767,16 +779,45 @@ async def I(
     )
 
 
+@mcp_extra.tool()
+async def todos() -> str:
+    """我看看记忆里有哪些待办：拉取所有未 resolved 桶的 todos 字段，以及 content 中 - [ ] 格式的待办项，按桶分组返回，附桶名和重要度。"""
+    return await _with_notice(
+        _t_todos.dispatch(),
+        op="todos",
+        args={},
+    )
+
+
+@mcp_extra.tool()
+async def archive_session(
+    summary: str,
+    highlights: Optional[str] = "",
+    mood: Optional[str] = "",
+    valence: Optional[float] = -1,
+    arousal: Optional[float] = -1,
+) -> str:
+    """将本次对话摘要存入记忆归档。summary=必填，对话摘要正文；highlights=可选，本次亮点；mood=可选，情绪描述；valence/arousal=可选，0~1情感坐标。"""
+    return await _with_notice(
+        _t_archive_session.dispatch(
+            summary=summary, highlights=highlights, mood=mood,
+            valence=valence, arousal=arousal,
+        ),
+        op="archive_session",
+        args={"summary_len": len(summary or ""), "highlights": highlights, "mood": mood},
+    )
+
+
 @mcp.tool()
-async def dream(window_hours: Optional[int] = 48) -> str:
+async def dream(window_hours: Optional[int] = 48, detail_ids: Optional[str] = "") -> str:
     """我做一次梦——读取最近 window_hours（默认 48h）内有变动的所有记忆桶,我自己沉进去想一遍。
-    每个桶返回它在窗口内的最新内容（按 last_active 取）,完整正文不截断。
+    默认返回前 5 个桶完整正文，其余只返回一行摘要。detail_ids=逗号分隔的 bucket_id，指定桶强制返回全文。
     想完之后我可以：能放下的 → trace(resolved=1) 让它沉底；有沉淀的 → hold(feel=True, source_bucket=...) 写下我带走的东西；没沉淀的就什么都不做,不强求。
     候选桶超过 40 时按 decay_engine.calculate_score() 排序取前 40，避免一次涌进来太多。"""
     return await _with_notice(
-        _t_dream.dispatch(window_hours=window_hours),
+        _t_dream.dispatch(window_hours=window_hours, detail_ids=detail_ids),
         op="dream",
-        args={"window_hours": window_hours},
+        args={"window_hours": window_hours, "detail_ids": detail_ids},
     )
 
 

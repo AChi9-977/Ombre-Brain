@@ -40,9 +40,13 @@ async def dispatch(
     domain: Optional[str] = "",
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
-    max_results: Optional[int] = 0,
+    max_results: Optional[int] = 5,
     importance_min: Optional[int] = -1,
     tags: Optional[str] = "",
+    mode: Optional[str] = "summary",
+    date_from: Optional[str] = "",
+    date_to: Optional[str] = "",
+    include_dormant: Optional[bool] = False,
 ) -> str:
     # --- Null-safe coercion ---
     if query is None: query = ""
@@ -50,19 +54,26 @@ async def dispatch(
     if domain is None: domain = ""
     if valence is None: valence = -1
     if arousal is None: arousal = -1
-    if max_results is None: max_results = 0
+    if max_results is None: max_results = 5
     if importance_min is None: importance_min = -1
     if tags is None: tags = ""
+    if mode is None: mode = "summary"
+    if date_from is None: date_from = ""
+    if date_to is None: date_to = ""
+    if include_dormant is None: include_dormant = False
+
+    # query 非空时强制 full 模式
+    if query and query.strip():
+        mode = "full"
 
     if rt.mark_op:
         rt.mark_op("breath")
     await rt.decay_engine.ensure_started()
 
     surfacing_cfg = rt.config.get("surfacing", {}) or {}
-    default_results = int(surfacing_cfg.get("breath_max_results") or 20)
     default_tokens = int(surfacing_cfg.get("breath_max_tokens") or 10000)
     if max_results <= 0:
-        max_results = default_results
+        max_results = 5
     if max_tokens <= 0:
         max_tokens = default_tokens
     max_results = min(max_results, 50)
@@ -92,6 +103,10 @@ async def dispatch(
             max_results=max_results,
             max_tokens=max_tokens,
             tag_filter=tag_filter,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            include_dormant=include_dormant,
         )
 
     # --- 有 query：检索模式 ---
@@ -103,4 +118,8 @@ async def dispatch(
         valence=valence,
         arousal=arousal,
         tag_filter=tag_filter,
+        mode=mode,
+        date_from=date_from,
+        date_to=date_to,
+        include_dormant=include_dormant,
     )

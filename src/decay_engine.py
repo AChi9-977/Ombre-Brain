@@ -287,7 +287,12 @@ class DecayEngine:
         checked = 0
         archived = 0
         auto_resolved = 0
+        auto_dormant = 0
         lowest_score = float("inf")
+
+        # E5: dormant 阈值常量
+        _DORMANT_IMPORTANCE_MAX = 2   # importance < 3
+        _DORMANT_DAYS_MIN = 30
 
         demoted_orphans = 0
         for bucket in buckets:
@@ -342,6 +347,26 @@ class DecayEngine:
                     except Exception as e:
                         logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
 
+            # E5: dormant 标记 — importance<3 且 30天未访问 且未钉选 → 标 dormant
+            if (
+                not meta.get("dormant", False)
+                and not meta.get("pinned")
+                and not meta.get("protected")
+                and int(meta.get("importance") or _DEFAULT_IMPORTANCE) <= _DORMANT_IMPORTANCE_MAX
+            ):
+                days_d = _days_since_active(meta, fallback_days=_DORMANT_DAYS_MIN + 1)
+                if days_d > _DORMANT_DAYS_MIN:
+                    try:
+                        await self.bucket_mgr.update(bucket["id"], dormant=True)
+                        auto_dormant += 1
+                        logger.info(
+                            f"Auto-dormant / 自动休眠: "
+                            f"{meta.get('name', bucket['id'])} "
+                            f"(imp={int(meta.get('importance') or _DEFAULT_IMPORTANCE)}, days={days_d:.0f})"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Auto-dormant failed: {e}")
+
             try:
                 score = self.calculate_score(meta)
             except Exception as e:
@@ -375,6 +400,7 @@ class DecayEngine:
             "checked": checked,
             "archived": archived,
             "auto_resolved": auto_resolved,
+            "auto_dormant": auto_dormant,
             "lowest_score": lowest_score if checked > 0 else 0,
         }
         logger.info(f"Decay cycle complete / 衰减周期完成: {result}")

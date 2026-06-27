@@ -23,7 +23,7 @@ from .hints import build_connection_hint, build_crystal_hint
 from .output import format_dream_output
 
 
-async def dispatch(window_hours: Optional[int] = 48) -> str:
+async def dispatch(window_hours: Optional[int] = 48, detail_ids: Optional[str] = "") -> str:
     await rt.decay_engine.ensure_started()
 
     try:
@@ -37,6 +37,9 @@ async def dispatch(window_hours: Optional[int] = 48) -> str:
     if not recent:
         return f"过去 {window_hours} 小时内没有需要消化的新记忆。"
 
+    # B3: 默认只返回前 5 个桶的摘要；detail_ids 中的桶返回全文
+    detail_id_set = {s.strip() for s in (detail_ids or "").split(",") if s.strip()}
+
     connection_hint = await build_connection_hint(recent)
     crystal_hint = await build_crystal_hint(all_buckets)
 
@@ -46,6 +49,7 @@ async def dispatch(window_hours: Optional[int] = 48) -> str:
         window_hours=window_hours,
         connection_hint=connection_hint,
         crystal_hint=crystal_hint,
+        detail_id_set=detail_id_set,
     )
 
     if rt.fire_webhook:

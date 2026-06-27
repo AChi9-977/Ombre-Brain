@@ -27,15 +27,22 @@ from .. import _runtime as rt
 from utils import strip_wikilinks, count_tokens_approx
 
 
+_DREAM_DEFAULT_FULL = 5  # B3: 默认返回前 N 个桶全文，其余摘要
+
+
 def format_dream_output(
     recent: list,
     all_buckets: list,
     window_hours: int,
     connection_hint: str,
     crystal_hint: str,
+    detail_id_set: set | None = None,
 ) -> str:
+    if detail_id_set is None:
+        detail_id_set = set()
+
     parts = []
-    for b in recent:
+    for idx, b in enumerate(recent):
         meta = b["metadata"]
         resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
         domains = ",".join(meta.get("domain", []))
@@ -43,13 +50,22 @@ def format_dream_output(
         aro = float(meta.get("arousal") or 0.3)
         created = meta.get("created", "")
         last_active = meta.get("last_active", "")
-        parts.append(
-            f"[{meta.get('name', b['id'])}]{resolved_tag} "
-            f"主题:{domains} V{val:.1f}/A{aro:.1f} "
-            f"创建:{created} 最近活跃:{last_active}\n"
-            f"ID: {b['id']}\n"
-            f"{strip_wikilinks(b['content'])}"
-        )
+        # B3: detail_ids 中的桶全文；否则前 _DREAM_DEFAULT_FULL 个全文，其余摘要
+        show_full = b["id"] in detail_id_set or idx < _DREAM_DEFAULT_FULL
+        if show_full:
+            parts.append(
+                f"[{meta.get('name', b['id'])}]{resolved_tag} "
+                f"主题:{domains} V{val:.1f}/A{aro:.1f} "
+                f"创建:{created} 最近活跃:{last_active}\n"
+                f"ID: {b['id']}\n"
+                f"{strip_wikilinks(b['content'])}"
+            )
+        else:
+            snippet = strip_wikilinks(b["content"]).replace("\n", " ")[:60]
+            parts.append(
+                f"[摘要] [{b['id']}]{resolved_tag} 主题:{domains} "
+                f"V{val:.1f}/A{aro:.1f} {snippet}… (dream(detail_ids=\"{b['id']}\") 查看全文)"
+            )
 
     header = (
         f"=== Dreaming · 过去 {window_hours} 小时全量记忆（{len(recent)} 个桶）===\n"
