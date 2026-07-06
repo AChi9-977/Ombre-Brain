@@ -223,6 +223,11 @@ decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引�
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 migrate_engine = MigrateEngine(config, bucket_mgr, embedding_engine)              # Migrate engine / 记忆包迁移引擎
 
+# --- Desire engine / 欲望引擎（内核纯函数在 desire_engine.py，接线层在 desire_runtime.py）---
+# 只读状态永远可看；行为覆盖走 OMBRE_DESIRE_DRIVEN 总闸（默认关）。
+from desire_runtime import DesireRuntime
+desire_runtime = DesireRuntime(config, bucket_mgr)
+
 # --- GitHub Sync / GitHub 同步 ---
 from github_sync import GitHubSync  # type: ignore
 _gh_cfg = config.get("github_sync", {}) or {}
@@ -348,6 +353,7 @@ _wsh.init_runtime(
     migrate_engine=migrate_engine,
     github_sync_instance=github_sync_instance,
     restart_github_auto_task=_restart_github_auto_task,
+    desire_runtime=desire_runtime,
 )
 # 启动时把磁盘上的会话装回内存（容器重启不踢登录）。鉴权/会话逻辑全在 web/_shared.py，
 # server.py 自身已无 @mcp.custom_route 路由，只需启动时载入一次会话。
@@ -505,6 +511,21 @@ async def _with_notice(coro: Awaitable[str], op: str = "", args: dict | None = N
     # 正常路径
     if op:
         _log_op_ok(op, result)
+        # --- 欲望引擎：把这次真实调用当事件喂进去（全程吞错，永不影响主流程）---
+        try:
+            desire_runtime.on_tool_event(op, args or {})
+            await desire_runtime.ensure_started()
+        except Exception:
+            pass
+        try:
+            if op == "pulse":
+                # 自检时看一眼我自己此刻想什么（只读，不 gate）
+                result += desire_runtime.state_text()
+            elif op == "breath" and not (args or {}).get("query"):
+                # 浮现模式尾部一行「此刻」——只有 DESIRE_DRIVEN 总闸开了才附
+                result += desire_runtime.breath_suffix()
+        except Exception:
+            pass
     try:
         extras = format_warnings_suffix(pop_warnings())
     except Exception:
@@ -931,6 +952,11 @@ if __name__ == "__main__":
                             await decay_engine.start()
                         except Exception as _decay_exc:
                             logger.warning(f"decay engine start at boot failed: {_decay_exc}")
+                        # 欲望心跳与 decay 同级：开机即跳，不等首个工具调用
+                        try:
+                            await desire_runtime.start()
+                        except Exception as _desire_exc:
+                            logger.warning(f"desire heartbeat start at boot failed: {_desire_exc}")
                         # 裸机 + 本地向量化时，把 ollama 作为 OB 子进程拉起（常驻）。
                         # Docker / 云端向量化下是 no-op。
                         try:
@@ -939,6 +965,10 @@ if __name__ == "__main__":
                         except Exception as _ol_exc:
                             logger.warning(f"ollama child boot failed: {_ol_exc}")
                         yield
+                        try:
+                            await desire_runtime.stop()
+                        except Exception:
+                            pass
                         try:
                             await decay_engine.stop()
                         except Exception:

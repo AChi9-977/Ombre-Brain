@@ -80,6 +80,7 @@ embedding_engine = None
 import_engine = None
 migrate_engine = None
 github_sync_instance = None
+desire_runtime = None
 
 
 def init(cfg: dict) -> None:

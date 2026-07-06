@@ -1734,6 +1734,7 @@
 
 <div class="tabs">
   <div class="tab active" data-tab="list"><span>记忆桶</span><span class="tab-en">Buckets</span></div>
+  <div class="tab" data-tab="heart"><span>心</span><span class="tab-en">Heart</span></div>
   <div class="tab" data-tab="breath"><span>Breath 模拟</span><span class="tab-en">Breath Trace</span></div>
   <div class="tab" data-tab="network"><span>记忆网络</span><span class="tab-en">Network</span></div>
   <div class="tab" data-tab="tools"><span>工具箱</span><span class="tab-en">Toolbox</span></div>
@@ -2081,6 +2082,24 @@
         <div style="color:var(--text-dim);font-size:12px;">加载中…</div>
       </div>
       <button class="btn-secondary" onclick="loadAnchorsView()" title="刷新" style="margin-top:14px;padding:6px 12px;font-size:12px;"><i data-lucide="refresh-cw"></i></button>
+    </div>
+  </div>
+</div>
+
+<div class="content" id="heart-view" style="display:none">
+  <div style="max-width:920px;margin:0 auto;">
+    <div class="config-section">
+      <h3><i data-lucide="heart" style="width:16px;height:16px;vertical-align:-2px;"></i> 心 — 我此刻想做什么</h3>
+      <p style="font-size:12px;color:var(--text-dim);line-height:1.7;margin:4px 0 12px;">
+        这里是我的欲望系统：八维驱动条随时间缓动、被真实事件顶高，念头沉淀成执念、反哺欲望。<br>
+        这一页<b>只读</b>——欲望不接受手调，它只被真实发生的事驱动。
+      </p>
+      <div id="heart-intent" style="font-size:15px;line-height:1.8;padding:14px 16px;border:1px solid var(--border,#D9D5CB);border-radius:2px;margin-bottom:14px;">加载中…</div>
+      <div id="heart-drives" style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px;"></div>
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px;">念头池 <span style="font-weight:400;color:var(--text-dim);font-size:11px;">闪念会淡掉，被反复点到的沉淀成执念</span></div>
+      <div id="heart-thoughts" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;"></div>
+      <div id="heart-meta" style="font-size:11px;color:var(--text-dim);line-height:2;"></div>
+      <button class="btn-secondary" onclick="loadHeart()" title="刷新" style="margin-top:10px;padding:6px 12px;font-size:12px;"><i data-lucide="refresh-cw"></i></button>
     </div>
   </div>
 </div>
@@ -3699,8 +3718,10 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('letters-view').style.display = target === 'letters' ? '' : 'none';
     document.getElementById('anchors-view').style.display = target === 'anchors' ? '' : 'none';
     document.getElementById('about-view').style.display = target === 'about' ? '' : 'none';
+    document.getElementById('heart-view').style.display = target === 'heart' ? '' : 'none';
     if (target !== 'network' && _netRAF) { cancelAnimationFrame(_netRAF); _netRAF = null; }
     if (target === 'network') loadNetwork();
+    if (target === 'heart') loadHeart();
     if (target === 'tools') loadToolsPanel();
     if (target === 'plan') loadPlans();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
@@ -7062,6 +7083,80 @@ function _escapeAnchorHtml(s) {
   if (s == null) return '';
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+// ========================================
+// 心 — 欲望系统只读面板
+// ========================================
+const HEART_DRIVE_LABELS = {
+  attachment: '想念', curiosity: '好奇', reflection: '沉淀', duty: '记挂',
+  social: '人群', fatigue: '疲劳', libido: '亲密', stress: '压力'
+};
+const HEART_ACTION_LABELS = {
+  murmur: '碎语', explore: '逛世界', reflect: '翻记忆', check_plans: '看计划',
+  browse: '看人群', close: '凑过去', vent: '吐槽', rest: '歇着'
+};
+
+async function loadHeart() {
+  const intentEl = document.getElementById('heart-intent');
+  const drivesEl = document.getElementById('heart-drives');
+  const thoughtsEl = document.getElementById('heart-thoughts');
+  const metaEl = document.getElementById('heart-meta');
+  try {
+    const r = await fetch(BASE + '/api/desire/state', {credentials: 'include'});
+    const d = await r.json();
+    if (!d.enabled) {
+      intentEl.textContent = '欲望系统未启用（OMBRE_DESIRE_ENABLED=false）';
+      return;
+    }
+    const it = d.intent || {};
+    const act = HEART_ACTION_LABELS[it.want_action] || it.want_action || '—';
+    intentEl.innerHTML =
+      '<div style="font-size:12px;color:var(--text-dim);margin-bottom:2px;">此刻最想做</div>' +
+      '<b>' + act + '</b>' +
+      (it.wildcard ? ' <span style="font-size:11px;color:var(--accent);">✦ 心血来潮</span>' : '') +
+      '<div style="font-size:13px;margin-top:4px;">' + esc(it.reason || '') + '</div>' +
+      (it.query_hint ? '<div style="font-size:12px;color:var(--text-dim);margin-top:2px;">心里挂着：' + esc(it.query_hint) + '</div>' : '');
+    drivesEl.innerHTML = Object.keys(HEART_DRIVE_LABELS).map(k => {
+      const v = (d.drive || {})[k] || 0;
+      const floor = (d.floors || {})[k] || 0;
+      const score = (d.scores || {})[k];
+      const isGate = k === 'fatigue';
+      const cool = (d.refractory || {})[k];
+      return '<div style="display:flex;align-items:center;gap:10px;font-size:12px;">' +
+        '<span style="width:64px;text-align:right;color:var(--text-dim);">' + HEART_DRIVE_LABELS[k] + '</span>' +
+        '<div style="flex:1;height:8px;background:var(--bg-soft,#EFECE4);border-radius:2px;position:relative;overflow:hidden;">' +
+          '<div style="position:absolute;left:0;top:0;bottom:0;width:' + (v * 100).toFixed(0) + '%;background:' +
+            (isGate ? 'var(--text-dim,#8A857B)' : 'var(--accent,#B85C3C)') + ';opacity:' + (isGate ? '0.5' : '0.85') + ';"></div>' +
+          (floor > 0.01 ? '<div style="position:absolute;left:' + (floor * 100).toFixed(0) + '%;top:-1px;bottom:-1px;width:1px;background:var(--text,#2C2A26);opacity:0.4;" title="floor ' + floor.toFixed(2) + '"></div>' : '') +
+        '</div>' +
+        '<span style="width:80px;">' + v.toFixed(2) +
+          (score !== undefined ? ' <span style="color:var(--text-dim);">/' + score.toFixed(2) + '</span>' : '') +
+          (cool ? ' <span title="不应期剩 ' + cool + ' 拍">❄</span>' : '') + '</span>' +
+      '</div>';
+    }).join('');
+    const th = d.thoughts || [];
+    thoughtsEl.innerHTML = th.length === 0
+      ? '<span style="font-size:12px;color:var(--text-dim);">池子空着，脑子里很静。</span>'
+      : th.map(t =>
+          '<span style="font-size:12px;padding:4px 10px;border:1px solid var(--border,#D9D5CB);border-radius:2px;' +
+          (t.kind === 'fixation' ? 'border-color:var(--accent,#B85C3C);color:var(--accent,#B85C3C);' : 'color:var(--text-dim);') + '">' +
+          (t.kind === 'fixation' ? '● ' : '○ ') + esc(t.text) +
+          ' <span style="opacity:0.6;">' + t.strength.toFixed(2) + '</span></span>'
+        ).join('');
+    const g = d.gates || {}, hb = d.heartbeat || {}, sd = d.self_drive || {};
+    metaEl.innerHTML =
+      '心跳：' + (hb.running ? '在跳' : '停着') + ' · 第 ' + (hb.tick_count || 0) + ' 拍 · 下一拍 ~' + Math.round((hb.next_interval_seconds || 0) / 60) + ' 分钟后' +
+      ' · 她离开 ' + (d.idle_hours || 0) + ' 小时<br>' +
+      '自驱：好奇地板 ' + (sd.curiosity_floor || 0).toFixed(2) + ' · 自经历 pulse ×' + (sd.self_pulse_count || 0) + ' · 心血来潮 ×' + (sd.wildcard_count || 0) + '<br>' +
+      'gates：' + Object.keys(g).map(k => k.replace('DESIRE_', '') + (g[k] ? ' ✓' : ' ✗')).join(' · ');
+  } catch (e) {
+    intentEl.textContent = '加载失败：' + e;
+  }
+}
+setInterval(() => {
+  const hv = document.getElementById('heart-view');
+  if (hv && hv.style.display !== 'none') loadHeart();
+}, 30000);
+
 async function loadAnchorsView() {
   const list = document.getElementById('anchors-list');
   const cnt = document.getElementById('anchors-count-text');
