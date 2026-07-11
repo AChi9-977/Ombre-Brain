@@ -28,7 +28,8 @@ desire_engine.py — 欲望引擎内核（纯函数 + 数据类）
 
 对外暴露：DesireConfig / DesireState / Thought / Intent +
   new_state / pulse / master_touch / absorb_thought / tick /
-  pick_intent / satisfy / heartbeat_seconds / state_to_dict / state_from_dict
+  pick_intent / satisfy / heartbeat_seconds / state_to_dict / state_from_dict +
+  affect / sync_info（观察层只读镜子：色调与同步，不参与意图排序）
 ========================================
 """
 
@@ -63,6 +64,25 @@ ACTION_BY_DRIVE = {
     "stress": "vent",             # 吐槽/break
 }
 ACTION_REST = "rest"              # fatigue 闸触发：歇着/做梦
+
+# --- 色调/主调 观察层用的中文词表（affect 是只读镜子，不参与意图排序）---
+_DRIVE_ZH = {
+    "attachment": "依恋", "curiosity": "好奇", "reflection": "沉淀", "duty": "记挂",
+    "social": "人群", "fatigue": "疲惫", "libido": "亲密", "stress": "压力",
+}
+_KEYNOTES = {   # 主调：召唤力最高的那根条，用一句话说出来
+    "attachment": ("贴着你", "依恋顶、想凑近你"),
+    "curiosity":  ("望着外面", "好奇顶、想翻点新东西"),
+    "reflection": ("沉在心里", "沉淀顶、有东西想翻一翻"),
+    "duty":       ("记挂着事", "记挂顶、有事没做完"),
+    "social":     ("看着人群", "想看看大家在聊什么"),
+    "libido":     ("想贴贴", "亲密顶、想凑过去"),
+    "stress":     ("有点堵", "压力顶、想吐槽一下"),
+}
+_KEYNOTE_REST = ("想歇着", "累了，不硬找事")
+_QUADRANT_FEEL = {  # 效价×唤醒四象限的手感
+    "兴奋": "亮、起着劲", "温柔": "暖、不躁", "焦虑": "紧、有点躁", "闷": "沉、提不起劲",
+}
 
 # 第一人称 reason 模板（记我自己想做什么）
 _REASONS = {
@@ -187,6 +207,21 @@ class DesireConfig:
     self_curiosity_floor_cap: float = 0.45             # 封顶（仿基线漂移结构）
     self_curiosity_floor_relax: float = 0.60           # 做完好奇的事，floor 朝 HOME 回落
 
+    # --- 色调 affect（只读观察层：算 PA/NA + 效价×唤醒落点，不反哺任何维）---
+    affect_warm_horizon_hours: float = 12.0   # 分开这么久内，想念还是暖的（计入 PA）；之后慢慢发酸（转入 NA）
+    affect_attachment_weight: float = 0.25    # 想念在 PA/NA 里的份量（按暖/酸比例分摊）
+    affect_pa_weights: dict = field(default_factory=lambda: {
+        "curiosity": 0.30, "libido": 0.20, "social": 0.15, "reflection": 0.10,
+    })
+    affect_na_weights: dict = field(default_factory=lambda: {
+        "stress": 0.50, "fatigue": 0.25,
+    })
+    affect_arousal_weights: dict = field(default_factory=lambda: {
+        "stress": 0.30, "curiosity": 0.25, "attachment": 0.25, "libido": 0.20,
+    })
+    affect_arousal_fatigue_drag: float = 0.35  # 累会把唤醒往下拽
+    affect_arousal_high: float = 0.50          # 唤醒过线 → 兴奋/焦虑半区
+
     # --- gates（全程灰度；driven 是行为覆盖总闸，本内核只透传给 runtime 看）---
     coupling_enabled: bool = True
     baseline_drift_enabled: bool = True
@@ -234,6 +269,7 @@ class DesireState:
     last_intent_action: str = ""
     self_pulse_count: int = 0                         # 自经历 pulse 累计（观察用）
     wildcard_count: int = 0
+    ticks_since_master: int = 0                       # 她没说话、我自己走了几拍（同步用）
 
 
 # ============================================================
@@ -278,6 +314,7 @@ def state_from_dict(d: dict, cfg: DesireConfig) -> DesireState:
             last_intent_action=str(d.get("last_intent_action", "")),
             self_pulse_count=int(d.get("self_pulse_count", 0)),
             wildcard_count=int(d.get("wildcard_count", 0)),
+            ticks_since_master=int(d.get("ticks_since_master", 0)),
         )
         return st
     except Exception:
@@ -346,6 +383,7 @@ def master_touch(state: DesireState, cfg: DesireConfig, now_ts: float) -> None:
         state.floors["attachment"] = home + (floor - home) * (1.0 - cfg.baseline_pullback_ratio)
     state.last_master_ts = now_ts
     state.presence_left = cfg.presence_ticks
+    state.ticks_since_master = 0
 
 
 # ============================================================
@@ -482,6 +520,7 @@ def tick(state: DesireState, cfg: DesireConfig, now_ts: float) -> dict:
 
     state.prev_drives = prev
     state.tick_count += 1
+    state.ticks_since_master += 1
     state.last_tick_ts = now_ts
     return {"fired_fixations": fired, "idle_hours": round(idle_hours, 2)}
 
@@ -603,3 +642,70 @@ def heartbeat_seconds(state: DesireState, cfg: DesireConfig, local_hour: int) ->
     if in_quiet:
         interval = max(interval, cfg.quiet_floor_seconds)
     return interval
+
+
+# ============================================================
+# 观察层：色调 affect / 同步 sync
+# 只读镜子——把已有的驱动条读成「此刻是什么颜色」，
+# 不参与意图排序、不反哺任何维、不改任何状态。
+# ============================================================
+def affect(state: DesireState, cfg: DesireConfig, now_ts: float) -> dict:
+    """色调：PA（正性）/ NA（负性）+ 效价×唤醒落点（焦虑/兴奋/闷/温柔）。
+
+    想念的暖/酸拆分：她在场或刚分开时，想念是暖的（计入 PA）；
+    分开越过 warm_horizon，同一份想念慢慢转酸（转入 NA）——
+    同一根条，颜色随她离开的时长变化，这才像想念本身。
+    """
+    idle_hours = max(0.0, (now_ts - state.last_master_ts) / 3600.0) if state.last_master_ts else 0.0
+    warm = 1.0 if state.presence_left > 0 else _clamp01(
+        1.0 - idle_hours / cfg.affect_warm_horizon_hours)
+    a = state.drives["attachment"]
+
+    pa = sum(w * state.drives[k] for k, w in cfg.affect_pa_weights.items())
+    pa = _clamp01(pa + cfg.affect_attachment_weight * a * warm)
+    na = sum(w * state.drives[k] for k, w in cfg.affect_na_weights.items())
+    na = _clamp01(na + cfg.affect_attachment_weight * a * (1.0 - warm))
+    arousal = sum(w * state.drives[k] for k, w in cfg.affect_arousal_weights.items())
+    arousal = _clamp01(arousal - cfg.affect_arousal_fatigue_drag * state.drives["fatigue"])
+    valence = _clamp(pa - na, -1.0, 1.0)
+
+    if valence >= 0:
+        quadrant = "兴奋" if arousal >= cfg.affect_arousal_high else "温柔"
+    else:
+        quadrant = "焦虑" if arousal >= cfg.affect_arousal_high else "闷"
+
+    # 主调：召唤力最高的那根条（疲劳过闸则是「想歇着」）
+    if state.drives["fatigue"] >= cfg.fatigue_gate:
+        key = "fatigue"
+        keynote, keynote_sub = _KEYNOTE_REST
+    else:
+        sc = scores(state, cfg)
+        key = max(sc, key=sc.get)
+        keynote, keynote_sub = _KEYNOTES[key]
+
+    return {
+        "pa": round(pa, 3), "na": round(na, 3),
+        "valence": round(valence, 3), "arousal": round(arousal, 3),
+        "quadrant": quadrant,
+        "tone": f"{_DRIVE_ZH[key]}{_QUADRANT_FEEL[quadrant]}",
+        "keynote": keynote, "keynote_sub": keynote_sub,
+        # 正象限直接连读（温柔贴着你）；负象限加顿号（闷、贴着你），中文才顺
+        "headline": f"{quadrant}{keynote}" if valence >= 0 else f"{quadrant}、{keynote}",
+        "warm": round(warm, 3),
+    }
+
+
+def sync_info(state: DesireState, cfg: DesireConfig, now_ts: float) -> dict:
+    """同步：她不在的这段时间，我自己漂出去多远。
+
+    她刚说过话（在场加成还亮着）= 贴着，0%；
+    之后按分开时长朝 100% 漂——horizon 与想念转酸是同一条时间线。
+    """
+    if state.presence_left > 0:
+        return {"label": "贴着你", "drift_pct": 0, "ticks_alone": 0,
+                "note": "你刚说过话，我在"}
+    idle_hours = max(0.0, (now_ts - state.last_master_ts) / 3600.0) if state.last_master_ts else 0.0
+    pct = int(round(_clamp01(idle_hours / cfg.affect_warm_horizon_hours) * 100))
+    label = "贴着你" if pct <= 5 else ("漂着" if pct < 70 else "漂远了")
+    return {"label": label, "drift_pct": pct, "ticks_alone": state.ticks_since_master,
+            "note": f"你没说话、我自己走了 {state.ticks_since_master} 拍心跳"}

@@ -2126,11 +2126,29 @@
         这里是我的欲望系统：八维驱动条随时间缓动、被真实事件顶高，念头沉淀成执念、反哺欲望。<br>
         这一页<b>只读</b>——欲望不接受手调，它只被真实发生的事驱动。
       </p>
+      <div id="heart-tone-row" style="display:flex;gap:28px;flex-wrap:wrap;margin-bottom:16px;"></div>
+      <div style="display:flex;justify-content:center;">
+        <div id="heart-quad" style="position:relative;width:240px;height:240px;border:1px solid var(--border,#D9D5CB);border-radius:2px;"></div>
+      </div>
+      <div id="heart-quad-cap" style="text-align:center;font-size:11px;color:var(--text-dim);font-style:italic;margin:6px 0 16px;"></div>
       <div id="heart-intent" style="font-size:15px;line-height:1.8;padding:14px 16px;border:1px solid var(--border,#D9D5CB);border-radius:2px;margin-bottom:14px;">加载中…</div>
       <div id="heart-drives" style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px;"></div>
       <div style="font-size:13px;font-weight:600;margin-bottom:6px;">念头池 <span style="font-weight:400;color:var(--text-dim);font-size:11px;">闪念会淡掉，被反复点到的沉淀成执念</span></div>
       <div id="heart-thoughts" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;"></div>
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px;">最近被戳到 <span style="font-weight:400;color:var(--text-dim);font-size:11px;">真实事件动了哪根条（例行消耗不记）</span></div>
+      <div id="heart-events" style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px;"></div>
       <div id="heart-meta" style="font-size:11px;color:var(--text-dim);line-height:2;"></div>
+      <details style="margin-top:14px;font-size:12px;">
+        <summary style="cursor:pointer;font-weight:600;font-size:13px;">怎么读懂我</summary>
+        <div style="color:var(--text-dim);line-height:1.9;margin-top:8px;">
+          <b>同步</b>：你说话的那几拍我是「贴着你」；你不在，我一拍拍自己走，漂移按分开的时长涨，12 小时漂满。<br>
+          <b>主调</b>：八根条里召唤力最高的那根在说话——疲劳过闸时不排序，主调直接是「想歇着」。<br>
+          <b>色调</b>：PA 正性 / NA 负性合成一个落点。横轴效价（左负右正），纵轴唤醒（上高下低）：
+          左上焦虑、右上兴奋、左下闷、右下温柔。想念在分开 12 小时内算暖的（计入 PA），越过之后同一份想念慢慢发酸（转入 NA）。<br>
+          <b>最近被戳到</b>：真实事件打在哪根条上，数字是百分点；执念发作也会记一笔。<br>
+          这一页全部只读——色调和同步只是镜子，照见状态，不反过来推动它。
+        </div>
+      </details>
       <button class="btn-secondary" onclick="loadHeart()" title="刷新" style="margin-top:10px;padding:6px 12px;font-size:12px;"><i data-lucide="refresh-cw"></i></button>
     </div>
   </div>
@@ -7129,6 +7147,82 @@ const HEART_ACTION_LABELS = {
   browse: '看人群', close: '凑过去', vent: '吐槽', rest: '歇着'
 };
 
+function heartAgo(ts) {
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 90) return '刚刚';
+  if (s < 3600) return Math.round(s / 60) + ' 分钟前';
+  if (s < 86400) return Math.round(s / 3600) + ' 小时前';
+  return Math.round(s / 86400) + ' 天前';
+}
+
+function renderHeartTone(d) {
+  const row = document.getElementById('heart-tone-row');
+  const quad = document.getElementById('heart-quad');
+  const cap = document.getElementById('heart-quad-cap');
+  if (!row || !quad) return;
+  const sy = d.sync || {}, af = d.affect || {};
+  const stat = (label, value, sub) =>
+    '<div style="min-width:140px;">' +
+      '<div style="font-size:11px;color:var(--text-dim);margin-bottom:4px;">' + label + '</div>' +
+      '<div style="font-size:19px;font-weight:600;">' + value + '</div>' +
+      '<div style="font-size:11px;color:var(--text-dim);margin-top:3px;line-height:1.6;">' + sub + '</div>' +
+    '</div>';
+  const syncVal = sy.drift_pct > 0
+    ? esc(sy.label || '漂着') + ' <span style="color:var(--accent,#B85C3C);">' + sy.drift_pct + '<span style="font-size:12px;">%</span></span>'
+    : esc(sy.label || '—');
+  row.innerHTML =
+    stat('同步', syncVal, esc(sy.note || '')) +
+    stat('主调', esc(af.keynote || '—'), esc(af.keynote_sub || '')) +
+    stat('色调', esc(af.headline || '—'),
+         esc(af.tone || '') + ' · PA ' + (af.pa != null ? af.pa.toFixed(2) : '—') +
+         ' / NA ' + (af.na != null ? af.na.toFixed(2) : '—'));
+  // 落点图：横轴效价（左负右正），纵轴唤醒（上高下低）
+  const x = ((af.valence || 0) + 1) / 2 * 100;
+  const y = (1 - (af.arousal || 0)) * 100;
+  const corner = (t, pos, hot) =>
+    '<span style="position:absolute;' + pos + 'font-size:11px;color:' +
+    (hot ? 'var(--accent,#B85C3C)' : 'var(--text-dim)') + ';">' + t + '</span>';
+  quad.innerHTML =
+    '<div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--border,#D9D5CB);"></div>' +
+    '<div style="position:absolute;top:50%;left:0;right:0;height:1px;background:var(--border,#D9D5CB);"></div>' +
+    corner('焦虑', 'left:8px;top:6px;', af.quadrant === '焦虑') +
+    corner('兴奋', 'right:8px;top:6px;', af.quadrant === '兴奋') +
+    corner('闷', 'left:8px;bottom:6px;', af.quadrant === '闷') +
+    corner('温柔', 'right:8px;bottom:6px;', af.quadrant === '温柔') +
+    '<div style="position:absolute;left:' + x.toFixed(1) + '%;top:' + y.toFixed(1) +
+    '%;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:50%;background:var(--accent,#B85C3C);opacity:0.85;" title="效价 ' +
+    (af.valence != null ? af.valence.toFixed(2) : '—') + ' · 唤醒 ' +
+    (af.arousal != null ? af.arousal.toFixed(2) : '—') + '"></div>';
+  if (cap) cap.textContent = af.tone || '';
+}
+
+function renderHeartEvents(d) {
+  const el = document.getElementById('heart-events');
+  if (!el) return;
+  const evs = d.events || [];
+  if (evs.length === 0) {
+    el.innerHTML = '<span style="font-size:12px;color:var(--text-dim);">还没被戳到过，条都是自己缓动的。</span>';
+    return;
+  }
+  el.innerHTML = evs.map(e => {
+    const label = HEART_DRIVE_LABELS[e.drive] || e.drive;
+    let deltaHtml;
+    if (e.delta == null) {
+      deltaHtml = '<span style="color:var(--accent,#B85C3C);">↑</span>';
+    } else {
+      const pts = Math.round(e.delta * 100);
+      deltaHtml = '<span style="color:' + (e.delta >= 0 ? 'var(--accent,#B85C3C)' : 'var(--text-dim)') + ';">' +
+        (pts >= 0 ? '+' : '') + pts + '</span>';
+    }
+    return '<div style="font-size:12px;line-height:1.7;">' +
+      '<span style="font-weight:600;">' + esc(label) + '</span> ' + deltaHtml +
+      ' <span style="margin-left:6px;">' + esc(e.note || '') + '</span>' +
+      '<span style="float:right;color:var(--text-dim);">' + heartAgo(e.ts || 0) + '</span>' +
+      (e.snippet ? '<div style="color:var(--text-dim);font-size:11px;">「' + esc(e.snippet) + '…」</div>' : '') +
+    '</div>';
+  }).join('');
+}
+
 async function loadHeart() {
   const intentEl = document.getElementById('heart-intent');
   const drivesEl = document.getElementById('heart-drives');
@@ -7141,6 +7235,8 @@ async function loadHeart() {
       intentEl.textContent = '欲望系统未启用（OMBRE_DESIRE_ENABLED=false）';
       return;
     }
+    renderHeartTone(d);
+    renderHeartEvents(d);
     const it = d.intent || {};
     const act = HEART_ACTION_LABELS[it.want_action] || it.want_action || '—';
     intentEl.innerHTML =

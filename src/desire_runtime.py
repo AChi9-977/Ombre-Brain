@@ -53,6 +53,23 @@ _BUCKET_THOUGHT_IMPORTANCE_MIN = 7
 # 她在场的工具：这些调用意味着她真的在跟我说话/交东西给我
 _MASTER_OPS = {"hold", "grow", "trace", "plan", "letter_write", "archive_session"}
 
+# --- 「最近被戳到」事件流水 ---
+_EVENTS_MAX = 40          # 流水上限（随状态文件持久化）
+_EVENT_MIN_DELTA = 0.01   # 变化小于这个的不进流水（例行疲劳消耗等噪音）
+_EVENT_NOTES = {          # 第一人称：这件事对我是什么
+    "hold": "她交给我一段要记住的东西",
+    "grow": "一段记忆长了一层",
+    "dream": "夜里做梦后回味和疲惫回落",
+    "breath": "翻了翻记忆",
+    "trace": "追了一件事的线",
+    "plan": "接了一个新计划",
+    "letter_write": "写了一封信",
+    "letter_read": "重读了一封信",
+    "I": "写了一段《我》",
+    "todos": "看了一眼要做的事",
+    "archive_session": "好好收好了这一场聊天",
+}
+
 # domain/tags 关键词 → 驱动维（找不到就 curiosity）
 _DRIVE_HINTS = (
     ("attachment", ("关系", "情感", "感情", "爱", "家人", "朋友", "她", "宝宝", "容")),
@@ -104,6 +121,7 @@ class DesireRuntime:
         except ValueError:
             self.tz_offset = 8
 
+        self.events: list = []   # 「最近被戳到」流水，_load_state 里随状态一起恢复
         self.state = self._load_state()
         self.current_intent: "de.Intent | None" = None
         self._task: "asyncio.Task | None" = None
@@ -125,6 +143,9 @@ class DesireRuntime:
                 with open(path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 st = de.state_from_dict(raw.get("state", {}), self.cfg)
+                ev = raw.get("events", [])
+                if isinstance(ev, list):
+                    self.events = ev[-_EVENTS_MAX:]
                 if not st.last_tick_ts:
                     st.last_tick_ts = now
                 if not st.last_master_ts:
@@ -144,7 +165,8 @@ class DesireRuntime:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"saved_at": now, "state": de.state_to_dict(self.state)},
+                json.dump({"saved_at": now, "state": de.state_to_dict(self.state),
+                           "events": self.events},
                           f, ensure_ascii=False)
             os.replace(tmp, path)
             self._last_save = now
@@ -188,7 +210,9 @@ class DesireRuntime:
         while self._running:
             try:
                 now = time.time()
-                de.tick(self.state, self.cfg, now)
+                beat = de.tick(self.state, self.cfg, now)
+                for f in beat.get("fired_fixations", []):
+                    self._note_event(f["drive"], None, "一个执念发作，把这根条顶了一下", f["text"])
                 self._beat_i += 1
                 if self._beat_i % _THOUGHT_SAMPLE_EVERY_BEATS == 1:
                     await self._sample_thoughts()
@@ -257,6 +281,22 @@ class DesireRuntime:
             de.absorb_thought(self.state, self.cfg, text, drive, strength)
 
     # ------------------------------------------------------------
+    # 「最近被戳到」流水
+    # ------------------------------------------------------------
+    def _note_event(self, drive: str, delta, note: str, snippet: str = "") -> None:
+        """记一笔：哪根条被真实事件动了。delta 为 None 表示方向已知但量不精确（执念发作）。"""
+        try:
+            self.events.append({
+                "ts": time.time(), "drive": drive,
+                "delta": round(float(delta), 4) if delta is not None else None,
+                "note": note, "snippet": snippet[:60],
+            })
+            if len(self.events) > _EVENTS_MAX:
+                self.events = self.events[-_EVENTS_MAX:]
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------
     # 事件入口：server.py 的 _with_notice 在每次工具调用成功后打进来
     # ------------------------------------------------------------
     def on_tool_event(self, op: str, args: dict) -> None:
@@ -266,6 +306,10 @@ class DesireRuntime:
         try:
             now = time.time()
             args = args or {}
+
+            # 例行消耗先打，且不进「被戳到」流水（每件事都费一点劲，不值得记）
+            de.pulse(self.state, self.cfg, "fatigue", self.cfg.fatigue_cost_per_op, source="self")
+            before = dict(self.state.drives)
 
             if op in _MASTER_OPS:
                 de.master_touch(self.state, self.cfg, now)
@@ -301,8 +345,15 @@ class DesireRuntime:
             elif op == "archive_session":
                 de.satisfy(self.state, self.cfg, "murmur")  # 好好聊过这一场
 
-            # 每做一件事都有一点消耗（不走边际递减以外的折扣：pulse 内部自带）
-            de.pulse(self.state, self.cfg, "fatigue", self.cfg.fatigue_cost_per_op, source="self")
+            # 「最近被戳到」：这次事件真实动了哪几根条，记进流水
+            note = _EVENT_NOTES.get(op)
+            if note:
+                snippet = str(args.get("content") or args.get("feel")
+                              or args.get("query") or "").strip()[:60]
+                for k in de.DRIVE_KEYS:
+                    dlt = self.state.drives[k] - before[k]
+                    if abs(dlt) >= _EVENT_MIN_DELTA:
+                        self._note_event(k, dlt, note, snippet)
 
             self.current_intent = de.pick_intent(self.state, self.cfg)
             self._save_state()
@@ -358,6 +409,9 @@ class DesireRuntime:
                 },
                 "idle_hours": round(max(0.0, (now - self.state.last_master_ts) / 3600.0), 2),
                 "refractory": dict(self.state.refractory),
+                "sync": de.sync_info(self.state, self.cfg, now),
+                "affect": de.affect(self.state, self.cfg, now),
+                "events": list(reversed(self.events[-12:])),  # 最新在前
             }
         except Exception as e:
             logger.warning(f"[desire] api_state failed: {e}")

@@ -466,3 +466,115 @@ class TestSerialization:
         st = state_from_dict({"drives": "garbage", "thoughts": [{"bad": 1}]}, cfg)
         for k in DRIVE_KEYS:
             assert 0.0 <= st.drives[k] <= 1.0
+
+    def test_ticks_since_master_roundtrip(self):
+        cfg = _cfg()
+        st = new_state(cfg, T0)
+        for i in range(5):
+            tick(st, cfg, T0 + (i + 1) * 600)
+        assert st.ticks_since_master == 5
+        st2 = state_from_dict(state_to_dict(st), cfg)
+        assert st2.ticks_since_master == 5
+
+
+# ============================================================
+# 观察层：色调 affect / 同步 sync（只读镜子，不参与意图排序）
+# ============================================================
+
+class TestAffectAndSync:
+    def test_affect_bounded_random(self):
+        """随机状态下 pa/na/arousal ∈ [0,1]，valence ∈ [-1,1]，象限词合法。"""
+        cfg = _cfg()
+        rng = random.Random(7)
+        for _ in range(50):
+            st = new_state(cfg, T0)
+            for k in DRIVE_KEYS:
+                st.drives[k] = rng.random()
+            st.presence_left = rng.choice([0, 0, 2])
+            st.last_master_ts = T0 - rng.random() * 48 * HOUR
+            a = de.affect(st, cfg, T0)
+            assert 0.0 <= a["pa"] <= 1.0
+            assert 0.0 <= a["na"] <= 1.0
+            assert 0.0 <= a["arousal"] <= 1.0
+            assert -1.0 <= a["valence"] <= 1.0
+            assert a["quadrant"] in ("兴奋", "温柔", "焦虑", "闷")
+            assert a["keynote"] and a["tone"] and a["headline"]
+
+    def test_stress_raises_na_lowers_valence(self):
+        """方向性：压力越高，NA 越高、效价越低。"""
+        cfg = _cfg()
+        calm = new_state(cfg, T0)
+        tense = new_state(cfg, T0)
+        tense.drives["stress"] = 0.9
+        a_calm = de.affect(calm, cfg, T0)
+        a_tense = de.affect(tense, cfg, T0)
+        assert a_tense["na"] > a_calm["na"]
+        assert a_tense["valence"] < a_calm["valence"]
+
+    def test_attachment_warm_when_present_ache_when_long_gone(self):
+        """想念的暖/酸：她在场时同一份想念计入 PA；分开很久后转入 NA。"""
+        cfg = _cfg()
+        st = new_state(cfg, T0)
+        st.drives["attachment"] = 0.8
+        st.presence_left = 2
+        st.last_master_ts = T0
+        warm = de.affect(st, cfg, T0)
+        st.presence_left = 0
+        st.last_master_ts = T0 - 36 * HOUR   # 远超 warm_horizon
+        ache = de.affect(st, cfg, T0)
+        assert warm["pa"] > ache["pa"]
+        assert ache["na"] > warm["na"]
+        assert warm["warm"] == 1.0
+        assert ache["warm"] == 0.0
+
+    def test_fatigue_gate_keynote_rest(self):
+        """疲劳过闸时主调是「想歇着」，不硬找事。"""
+        cfg = _cfg()
+        st = new_state(cfg, T0)
+        st.drives["fatigue"] = 0.95
+        a = de.affect(st, cfg, T0)
+        assert a["keynote"] == "想歇着"
+
+    def test_master_word_turns_keynote_to_her(self):
+        """红线的镜子面：她一句话之后，主调必须是「贴着你」。"""
+        cfg = _cfg()
+        st = new_state(cfg, T0)
+        st.drives["curiosity"] = 1.0
+        master_touch(st, cfg, T0 + 60)
+        a = de.affect(st, cfg, T0 + 60)
+        assert a["keynote"] == "贴着你"
+
+    def test_sync_present_vs_drifting(self):
+        """同步：在场 = 贴着 0%；分开越久漂移越大，封在 100%。"""
+        cfg = _cfg()
+        st = new_state(cfg, T0)
+        st.presence_left = 2
+        s = de.sync_info(st, cfg, T0)
+        assert s["label"] == "贴着你" and s["drift_pct"] == 0
+        st.presence_left = 0
+        st.last_master_ts = T0 - 4 * HOUR
+        s4 = de.sync_info(st, cfg, T0)
+        st.last_master_ts = T0 - 100 * HOUR
+        s100 = de.sync_info(st, cfg, T0)
+        assert 0 < s4["drift_pct"] < s100["drift_pct"] <= 100
+
+    def test_sync_ticks_alone_reset_by_master(self):
+        """她一来，「我自己走的拍数」清零。"""
+        cfg = _cfg()
+        st = new_state(cfg, T0)
+        for i in range(4):
+            tick(st, cfg, T0 + (i + 1) * 600)
+        assert st.ticks_since_master == 4
+        master_touch(st, cfg, T0 + 5 * 600)
+        assert st.ticks_since_master == 0
+
+    def test_affect_is_pure_observation(self):
+        """观察层不许动状态：affect / sync_info 调用前后状态完全不变。"""
+        cfg = _cfg()
+        st = new_state(cfg, T0)
+        pulse(st, cfg, "curiosity", 0.2, source="self")
+        tick(st, cfg, T0 + 600)
+        before = state_to_dict(st)
+        de.affect(st, cfg, T0 + 1200)
+        de.sync_info(st, cfg, T0 + 1200)
+        assert state_to_dict(st) == before
