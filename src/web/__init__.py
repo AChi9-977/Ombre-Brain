@@ -30,6 +30,7 @@ from . import embedding
 from . import ollama_local
 from . import config_api
 from . import desire
+from . import timeline
 
 
 def register_all(mcp) -> None:
@@ -51,3 +52,4 @@ def register_all(mcp) -> None:
     ollama_local.register(mcp)
     config_api.register(mcp)
     desire.register(mcp)
+    timeline.register(mcp)

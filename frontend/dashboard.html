@@ -1740,6 +1740,7 @@
   <div class="tab" data-tab="tools"><span>工具箱</span><span class="tab-en">Toolbox</span></div>
   <div class="tab" data-tab="plan"><span>计划</span><span class="tab-en">Plans</span></div>
   <div class="tab" data-tab="letters"><span>信</span><span class="tab-en">Letters</span></div>
+  <div class="tab" data-tab="timeline"><span>时间线</span><span class="tab-en">Timeline</span></div>
   <div class="tab" data-tab="anchors"><span>锚点</span><span class="tab-en">Anchors</span></div>
   <div class="tab" data-tab="import"><span>导入</span><span class="tab-en">Import</span></div>
   <div class="tab" data-tab="logs"><span>日志</span><span class="tab-en">Logs</span></div>
@@ -2063,6 +2064,37 @@
       </div>
       <div id="letters-list" style="display:flex;flex-direction:column;gap:14px;margin-top:6px;">
         <div style="text-align:center;color:var(--text-dim);padding:36px 0;font-size:13px;">点击「刷新」加载信件…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- v2.5: timeline view / 线性时间线面板 -->
+<div class="content" id="timeline-view" style="display:none">
+  <div style="max-width:920px;margin:0 auto;">
+    <div class="config-section">
+      <h3><i data-lucide="git-commit-vertical" style="width:16px;height:16px;vertical-align:-2px;"></i> 时间线 — 我们的大事记</h3>
+      <p style="font-size:12px;color:var(--text-dim);line-height:1.7;margin:4px 0 12px;">
+        线性的、按日期排好的一条线，每个点一两句话概括。<br>
+        换窗后的我先看这条线，再去记忆桶里找细节——桶是相关性检索的，这条线才是时间坐标轴。我和你都能增删改。
+      </p>
+      <div class="config-row">
+        <label>记一条</label>
+        <input type="date" id="tl-date" style="flex:0 0 170px;" />
+        <input type="text" id="tl-text" placeholder="一两句话概括这一天发生了什么…" maxlength="200" onkeydown="if(event.key==='Enter')addTimelineEntry()" />
+        <select id="tl-author" style="flex:0 0 110px;">
+          <option value="user">user</option>
+          <option value="claude">claude</option>
+        </select>
+        <button class="btn-primary" onclick="addTimelineEntry()" style="padding:8px 16px;font-size:12px;white-space:nowrap;">记入</button>
+      </div>
+      <div style="display:flex;gap:14px;align-items:center;margin-top:2px;">
+        <span id="tl-status" style="font-size:12px;color:var(--text-dim);"></span>
+        <span id="tl-count" style="font-size:11px;color:var(--text-dim);margin-left:auto;"></span>
+        <button class="btn-secondary" onclick="loadTimeline()" title="刷新" style="padding:6px 12px;font-size:12px;"><i data-lucide="refresh-cw"></i></button>
+      </div>
+      <div id="tl-list" style="margin-top:16px;">
+        <div style="text-align:center;color:var(--text-dim);padding:36px 0;font-size:13px;">加载中…</div>
       </div>
     </div>
   </div>
@@ -3716,6 +3748,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('logs-view').style.display = target === 'logs' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
     document.getElementById('letters-view').style.display = target === 'letters' ? '' : 'none';
+    document.getElementById('timeline-view').style.display = target === 'timeline' ? '' : 'none';
     document.getElementById('anchors-view').style.display = target === 'anchors' ? '' : 'none';
     document.getElementById('about-view').style.display = target === 'about' ? '' : 'none';
     document.getElementById('heart-view').style.display = target === 'heart' ? '' : 'none';
@@ -3743,6 +3776,7 @@ document.querySelectorAll('.tab').forEach(tab => {
       renderMcpUrls();
     }
     if (target === 'letters') loadLetters();
+    if (target === 'timeline') loadTimeline();
     if (target === 'anchors') loadAnchorsView();
     if (target === 'about') loadAbout();
   });
@@ -7329,6 +7363,115 @@ async function deleteLetter(id) {
     const r = await fetch(BASE + '/api/letter/' + encodeURIComponent(id) + '?confirm=true', { method: 'DELETE' });
     const d = await r.json();
     if (d.ok) { alert('已删除'); loadLetters(); }
+    else { alert(d.error || '删除失败'); }
+  } catch (e) { alert(e.message); }
+}
+
+// ── 时间线（v2.5）─────────────────────────────────────────────
+var _tlCache = [];
+
+function _tlCnDate(d) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(d || '');
+  if (!m) return d || '?';
+  return m[1] + '年' + parseInt(m[2], 10) + '月' + parseInt(m[3], 10) + '日';
+}
+
+async function loadTimeline() {
+  const list = document.getElementById('tl-list');
+  const cnt = document.getElementById('tl-count');
+  list.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:24px;">加载中…</div>';
+  try {
+    const r = await fetch(BASE + '/api/timeline');
+    const d = await r.json();
+    _tlCache = d.entries || [];
+    cnt.textContent = _tlCache.length + ' 条';
+    if (!_tlCache.length) {
+      list.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:36px 0;">时间线还是空的——从第一条开始。</div>';
+      return;
+    }
+    // 按日期分组（后端已按日期升序返回）
+    var groups = [];
+    _tlCache.forEach(function(e) {
+      if (!groups.length || groups[groups.length - 1].date !== e.date) {
+        groups.push({ date: e.date, items: [] });
+      }
+      groups[groups.length - 1].items.push(e);
+    });
+    list.innerHTML = '<div style="border-left:2px solid var(--border);margin-left:8px;padding-left:22px;display:flex;flex-direction:column;gap:18px;">' +
+      groups.map(function(g) {
+        var rows = g.items.map(function(e) {
+          var dot = e.author === 'claude' ? 'var(--accent)' : 'var(--text-dim)';
+          return '<div style="display:flex;align-items:baseline;gap:8px;font-size:13.5px;line-height:1.7;">' +
+            '<span title="' + (e.author === 'claude' ? 'claude 记的' : 'user 记的') + '" style="flex:0 0 6px;width:6px;height:6px;border-radius:50%;background:' + dot + ';align-self:center;"></span>' +
+            '<span style="flex:1;color:var(--text);">' + esc(e.text) + '</span>' +
+            '<span style="display:inline-flex;gap:6px;">' +
+              '<button onclick="editTimelineEntry(\'' + e.id + '\')" title="编辑" style="padding:2px 7px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="pencil" style="width:12px;height:12px;"></i></button>' +
+              '<button onclick="deleteTimelineEntry(\'' + e.id + '\')" title="删除" style="padding:2px 7px;background:transparent;border:1px solid var(--border);color:var(--accent);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="trash-2" style="width:12px;height:12px;"></i></button>' +
+            '</span></div>';
+        }).join('');
+        return '<div style="position:relative;">' +
+          '<span style="position:absolute;left:-27px;top:6px;width:8px;height:8px;border-radius:50%;background:var(--surface);border:2px solid var(--accent);"></span>' +
+          '<div style="font-size:12px;letter-spacing:0.12em;color:var(--text-dim);font-weight:600;margin-bottom:4px;">' + esc(_tlCnDate(g.date)) + '</div>' +
+          rows + '</div>';
+      }).join('') + '</div>';
+    if (window.lucide) lucide.createIcons();
+  } catch (e) {
+    list.innerHTML = '<div style="color:var(--negative);padding:18px;">加载失败：' + esc(e.message) + '</div>';
+  }
+}
+
+async function addTimelineEntry() {
+  const status = document.getElementById('tl-status');
+  const text = document.getElementById('tl-text').value.trim();
+  const date = document.getElementById('tl-date').value;
+  const author = document.getElementById('tl-author').value;
+  if (!text) { status.style.color = 'var(--negative)'; status.textContent = '内容为空'; return; }
+  status.style.color = 'var(--text-dim)'; status.textContent = '...';
+  try {
+    const r = await fetch(BASE + '/api/timeline', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ text: text, date: date, author: author }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      status.style.color = 'var(--accent)'; status.textContent = '已记入';
+      document.getElementById('tl-text').value = '';
+      loadTimeline();
+    } else {
+      status.style.color = 'var(--negative)'; status.textContent = d.error || '失败';
+    }
+  } catch (e) { status.style.color = 'var(--negative)'; status.textContent = e.message; }
+}
+
+async function editTimelineEntry(id) {
+  const en = _tlCache.find(function(x) { return x.id === id; });
+  if (!en) { alert('未找到该条目'); return; }
+  const newText = prompt('内容（留空则不改）：', en.text || '');
+  if (newText === null) return;
+  const newDate = prompt('日期 YYYY-MM-DD（留空则不改）：', en.date || '');
+  if (newDate === null) return;
+  const body = {};
+  if (newText.trim() && newText !== en.text) body.text = newText.trim();
+  if (newDate.trim() && newDate !== en.date) body.date = newDate.trim();
+  if (!Object.keys(body).length) { alert('未做任何修改'); return; }
+  try {
+    const r = await fetch(BASE + '/api/timeline/' + encodeURIComponent(id), {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.ok) { loadTimeline(); }
+    else { alert(d.error || '更新失败'); }
+  } catch (e) { alert(e.message); }
+}
+
+async function deleteTimelineEntry(id) {
+  const en = _tlCache.find(function(x) { return x.id === id; });
+  if (!confirm('删除这条时间线？\n' + (en ? _tlCnDate(en.date) + ' —— ' + en.text : id))) return;
+  try {
+    const r = await fetch(BASE + '/api/timeline/' + encodeURIComponent(id) + '?confirm=true', { method: 'DELETE' });
+    const d = await r.json();
+    if (d.ok) { loadTimeline(); }
     else { alert(d.error || '删除失败'); }
   } catch (e) { alert(e.message); }
 }

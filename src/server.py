@@ -69,6 +69,7 @@ from tools import plan as _t_plan
 from tools import dream as _t_dream
 from tools import i as _t_i
 from tools import todos as _t_todos
+from tools import timeline as _t_timeline
 from tools import archive_session as _t_archive_session
 from tools._common import (
     check_content_size as _check_content_size,
@@ -807,6 +808,23 @@ async def todos() -> str:
         _t_todos.dispatch(),
         op="todos",
         args={},
+    )
+
+
+@mcp_extra.tool()
+async def timeline(
+    text: Optional[str] = "",
+    date: Optional[str] = "",
+    entry_id: Optional[str] = "",
+    remove: Optional[bool] = False,
+) -> str:
+    """我们的线性时间线——按日期排好的大事记，换窗后先看这条线再去桶里找细节。
+    不带参数=读整条时间线（附[id]）；text=记一条（一两句话概括，date 空=今天，也可写 2026-06-19 / 6月19日）；
+    entry_id+text/date=改那条；entry_id+remove=True=删那条。容容也能在 dashboard 里增删改。"""
+    return await _with_notice(
+        _t_timeline.dispatch(text=text, date=date, entry_id=entry_id, remove=remove),
+        op="timeline",
+        args={"text_len": len(text or ""), "date": date, "entry_id": entry_id, "remove": remove},
     )
 
 
