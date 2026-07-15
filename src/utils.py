@@ -27,11 +27,15 @@ import os
 import re
 import sys
 import uuid
+import json
 import yaml
 import logging
+import math
+import tempfile
+import threading
 from pathlib import Path
-from datetime import datetime
-from typing import Optional
+from datetime import date, datetime
+from typing import Callable, Optional
 
 
 # ============================================================
@@ -50,18 +54,25 @@ _TOKEN_RATIO_PER_CHAR = 0.05     # 标点/空格等其它字符的兜底贡献
 # setup_logging() 文件日志轮转配置。
 _LOG_FILE_MAX_BYTES = 1_000_000  # 单个日志文件 1 MB 后轮转
 _LOG_FILE_BACKUP_COUNT = 3       # 保留 3 个历史文件
-_LOG_FALLBACK_DIR = "/tmp/ombre_logs"  # 所有候选路径都失败时的最终兜底
+_LOG_FALLBACK_DIR = os.path.join(tempfile.gettempdir(), "ombre_logs")
 
 # sanitize_name() 桶名最大长度（防止文件名过长导致 OS 报错）。
 _BUCKET_NAME_MAX_LEN = 80
 
-# 进程启动那一刻就被「真实 OS / 平台」注入的 OMBRE_* 环境变量名集合（值非空才算）。
+_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
+
+# 进程启动那一刻就被「真实 OS / 平台」注入的可配置环境变量名集合（值非空才算）。
 # 在任何 dashboard 保存动作 mutate os.environ 之前快照——这是「平台级 env」与
 # 「运行时被 dashboard 写进 os.environ 的值」唯一可靠的区分依据。
 # 用途：dashboard 据此提示「这些字段由平台环境变量提供，重启会覆盖你这里保存的值」，
 # 修复「config.yaml 存了 Gemini，但平台 OMBRE_COMPRESS_BASE_URL=DeepSeek 每次重启盖回」的坑。
+BOOT_ENV_CONFIG: frozenset[str] = frozenset(
+    k for k, v in os.environ.items()
+    if (k.startswith("OMBRE_") or k == "AI_NAME") and str(v).strip()
+)
 BOOT_ENV_OMBRE: frozenset[str] = frozenset(
-    k for k, v in os.environ.items() if k.startswith("OMBRE_") and str(v).strip()
+    k for k in BOOT_ENV_CONFIG if k.startswith("OMBRE_")
 )
 
 
@@ -94,6 +105,99 @@ def config_file_path() -> str:
     return os.path.join(_project_root(), "config.yaml")
 
 
+# 所有往 config.yaml 写东西的 Dashboard 接口（github/tunnel/config_api/buckets……）
+# 共用这一把锁 + 同一套原子写：谁都不能绕开它自己再开 open(path, "w") 整份覆盖。
+# 背景：github 备份配置曾经用「open(w) 直接整份覆盖、写失败只记 warning 但仍回 200」
+# 这种不安全写法，写失败时用户会看到「保存成功」、下次重启却发现配置又清空了。
+_config_yaml_lock = threading.RLock()
+
+
+def atomic_update_config_yaml(mutate: Callable[[dict], None]) -> dict:
+    """线程安全地读改写 config.yaml：加锁读现有内容，交给 ``mutate`` 原地 patch，
+    临时文件 + os.replace 原子落盘，写后回读校验内容确实落地了。
+
+    任何一步失败都直接抛异常——调用方必须把异常转成对用户如实的错误响应，
+    不能吞掉后仍然回「保存成功」，那样用户会以为配置在，其实只在内存里，
+    下次进程重启（崩溃/热更新/手动重启按钮）就会被磁盘上没写成功的旧内容盖掉。
+
+    返回值是写入后的完整 config dict（等价于重新读盘一次）。"""
+    config_path = config_file_path()
+    tmp = f"{config_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with _config_yaml_lock:
+        save_config: dict = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                save_config = yaml.safe_load(f) or {}
+        if not isinstance(save_config, dict):
+            save_config = {}
+        mutate(save_config)
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                yaml.dump(save_config, f, allow_unicode=True, default_flow_style=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, config_path)
+            with open(config_path, "r", encoding="utf-8") as f:
+                persisted = yaml.safe_load(f) or {}
+            if persisted != save_config:
+                raise OSError("config.yaml verification failed after write")
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+        return save_config
+
+
+def parse_bool(value, *, default=...) -> bool:
+    """Parse an explicit boolean without Python's ``bool('false')`` trap.
+
+    JSON/YAML callers may supply booleans, 0/1, or common textual forms. Other
+    values are rejected unless a default is supplied. This keeps public API
+    boundaries predictable while still accepting environment-style strings.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _BOOL_TRUE:
+            return True
+        if normalized in _BOOL_FALSE:
+            return False
+    # Ellipsis is a process-wide singleton, so this check remains valid even
+    # if a hot-update/test reloads utils while callers retain the old function.
+    if default is not ...:
+        return bool(default)
+    raise ValueError(f"expected boolean value, got {value!r}")
+
+
+def parse_iso_datetime(value) -> datetime:
+    """Parse ISO/date metadata into a timezone-compatible local datetime.
+
+    OB historically stores naive local timestamps, while imported/frontmatter
+    data may contain ``Z`` or explicit offsets. Converting aware values to local
+    time and dropping ``tzinfo`` lets existing ``datetime.now()`` comparisons
+    remain correct instead of treating valid timestamps as corrupt data.
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("empty datetime")
+        if raw[-1:].lower() == "z":
+            raw = raw[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
 def load_config(config_path: Optional[str] = None) -> dict:
     """
     Load configuration file.
@@ -108,6 +212,10 @@ def load_config(config_path: Optional[str] = None) -> dict:
     defaults = {
         "transport": "stdio",
         "log_level": "INFO",
+        "mcp_require_auth": True,
+        # 只有 mcp_require_auth=true 时才生效："oauth"（默认）或 "token"，二选一、互斥。
+        "mcp_auth_mode": "oauth",
+        "mcp_token": "",
         "buckets_dir": os.path.join(project_root, "buckets"),
         "merge_threshold": 75,
         "dehydration": {
@@ -116,6 +224,7 @@ def load_config(config_path: Optional[str] = None) -> dict:
             "api_key": "",
             "max_tokens": 4096,
             "temperature": 0.1,
+            "timeout_seconds": 60,
         },
         "decay": {
             "lambda": 0.05,
@@ -129,6 +238,18 @@ def load_config(config_path: Optional[str] = None) -> dict:
         "matching": {
             "fuzzy_threshold": 50,
             "max_results": 5,
+        },
+        "storage": {
+            "external_change_poll_seconds": 1.0,
+        },
+        "embedding": {
+            "enabled": True,
+            "background_indexing": True,
+            "retry_base_seconds": 5,
+            "retry_max_seconds": 300,
+            "circuit_failure_threshold": 3,
+            "circuit_base_seconds": 30,
+            "circuit_max_seconds": 600,
         },
     }
 
@@ -156,11 +277,39 @@ def load_config(config_path: Optional[str] = None) -> dict:
                 f"配置文件解析失败，使用默认配置: {e}"
             )
 
+    # Normalize YAML booleans before environment overrides. Quoted values such
+    # as mcp_require_auth: "false" must not become truthy via bool("false").
+    config["mcp_require_auth"] = parse_bool(
+        config.get("mcp_require_auth", True), default=True
+    )
+
     # --- Environment variable overrides (highest priority) ---
     # --- 环境变量覆盖敏感/运行时配置（优先级最高）---
     # 这里曾经有 6 段几乎一模一样的 if-block，每段都在做同一件事：
     #   "若环境变量非空 → 写到 config 的某个嵌套 key 上"
     # 现在统一走 _apply_env_override()，新增一项只要加一行表项。
+
+    # v1.x 兼容：旧变量不得因重构而静默失效。新变量显式设置时始终优先。
+    legacy_api_key = os.environ.get("OMBRE_API_KEY", "").strip()
+    legacy_base_url = os.environ.get("OMBRE_BASE_URL", "").strip()
+    if legacy_api_key and not os.environ.get("OMBRE_COMPRESS_API_KEY", "").strip():
+        config.setdefault("dehydration", {})["api_key"] = legacy_api_key
+        logging.warning(
+            "OMBRE_API_KEY 是兼容变量；请迁移到 OMBRE_COMPRESS_API_KEY，旧名仍会继续生效。"
+        )
+    if legacy_base_url and not os.environ.get("OMBRE_COMPRESS_BASE_URL", "").strip():
+        config.setdefault("dehydration", {})["base_url"] = legacy_base_url
+        logging.warning(
+            "OMBRE_BASE_URL 是兼容变量；请迁移到 OMBRE_COMPRESS_BASE_URL，旧名仍会继续生效。"
+        )
+
+    # v1.3 Zeabur 模板曾使用通用 PASSWORD；只在正式变量缺失时兼容映射。
+    legacy_password = os.environ.get("PASSWORD", "").strip()
+    if legacy_password and not os.environ.get("OMBRE_DASHBOARD_PASSWORD", "").strip():
+        os.environ["OMBRE_DASHBOARD_PASSWORD"] = legacy_password
+        logging.warning(
+            "PASSWORD 是兼容变量；请迁移到 OMBRE_DASHBOARD_PASSWORD，旧名仍会继续生效。"
+        )
 
     # 压缩组（脱水/打标/合并）—— 写到 config["dehydration"][*]
     _apply_env_override(config, "OMBRE_COMPRESS_API_KEY", "dehydration", "api_key")
@@ -169,30 +318,80 @@ def load_config(config_path: Optional[str] = None) -> dict:
     # Accept both names: OMBRE_COMPRESS_FORMAT (dashboard) and OMBRE_COMPRESS_API_FORMAT (legacy)
     _apply_env_override(config, "OMBRE_COMPRESS_FORMAT", "dehydration", "api_format")
     _apply_env_override(config, "OMBRE_COMPRESS_API_FORMAT", "dehydration", "api_format")
+    _apply_env_float_override(config, "OMBRE_COMPRESS_TIMEOUT_SECONDS", "dehydration", "timeout_seconds")
 
     # 向量化组（embedding）—— 写到 config["embedding"][*]
     _apply_env_override(config, "OMBRE_EMBED_API_KEY", "embedding", "api_key")
     _apply_env_override(config, "OMBRE_EMBED_BASE_URL", "embedding", "base_url")
     _apply_env_override(config, "OMBRE_EMBED_MODEL", "embedding", "model")
     _apply_env_override(config, "OMBRE_EMBED_FORMAT", "embedding", "api_format")
+    _apply_env_float_override(config, "OMBRE_EMBED_TIMEOUT_SECONDS", "embedding", "timeout_seconds")
+
+    # Obsidian / Git / manual Markdown edits cache poll interval.
+    _apply_env_float_override(
+        config,
+        "OMBRE_EXTERNAL_CHANGE_POLL_SECONDS",
+        "storage",
+        "external_change_poll_seconds",
+    )
 
     # 顶层运行时
     _apply_env_override(config, "OMBRE_TRANSPORT", "transport")
+    # transport 名归一化 —— 单一真源，让 server.py / 诊断接口拿到的都是规范值。
+    # 背景：远程接入（Operit / 安卓 / 自建前端等）该填 "streamable-http"，但很多人凭
+    # 直觉写成 "http" / "streamable_http" / "streamablehttp" 等变体；server.py 的入口用
+    # `transport in ("sse","streamable-http")` 精确匹配，写错就悄悄退回 stdio ——
+    # 于是根本不开 HTTP 服务、客户端一直连不上（Operit 表现为黄灯）。这里把所有等价写法
+    # 收敛成规范的 "streamable-http"，避免因一个连字符/下划线的差异排查半天。
+    # 只收敛已知别名；不认识的值原样保留，交给 server.py 走 mcp.run() 报明确的错。
+    _raw_transport = str(config.get("transport", "stdio")).strip().lower()
+    _transport_aliases = {
+        "http": "streamable-http",
+        "streamable": "streamable-http",
+        "streamable_http": "streamable-http",
+        "streamablehttp": "streamable-http",
+        "streamable-http": "streamable-http",
+        "http-stream": "streamable-http",
+        "streaming": "streamable-http",
+        "sse": "sse",
+        "stdio": "stdio",
+    }
+    config["transport"] = _transport_aliases.get(_raw_transport, _raw_transport)
     _apply_env_override(config, "OMBRE_BUCKETS_DIR", "buckets_dir")
     env_buckets_dir = os.environ.get("OMBRE_BUCKETS_DIR", "")
 
     # MCP OAuth 开关（布尔，单独处理）—— OMBRE_MCP_REQUIRE_AUTH
-    # 不能走 _apply_env_override：它只写字符串，而 server.py 用
-    # bool(config.get("mcp_require_auth", True)) 判定——字符串 "false" 是 truthy，
-    # 会导致设了 =false 反而仍开启鉴权。这里显式解析成真正的 bool。
+    # 不能走 _apply_env_override：它只写字符串，而鉴权中间件和诊断接口都要求
+    # 配置中保存真正的 bool；否则字符串 "false" 仍可能被普通真值判断误当成开启。
     # 用途：把 OB 接进自有前端 / GPT / GLM 等不走 OAuth 的客户端时，
     # 设 OMBRE_MCP_REQUIRE_AUTH=false（或 config.yaml: mcp_require_auth: false）即可免认证直连 /mcp。
     # 仅在显式设置为可识别的值时才覆盖；不设 / 设成乱七八糟的值都保持默认（安全：默认开启）。
-    _env_mcp_auth = os.environ.get("OMBRE_MCP_REQUIRE_AUTH", "").strip().lower()
-    if _env_mcp_auth in ("0", "false", "no", "off"):
-        config["mcp_require_auth"] = False
-    elif _env_mcp_auth in ("1", "true", "yes", "on"):
-        config["mcp_require_auth"] = True
+    _env_mcp_auth = os.environ.get("OMBRE_MCP_REQUIRE_AUTH", "").strip()
+    if _env_mcp_auth:
+        config["mcp_require_auth"] = parse_bool(
+            _env_mcp_auth, default=config["mcp_require_auth"]
+        )
+
+    # MCP 鉴权模式（枚举，仅 mcp_require_auth=true 时生效）—— mcp_auth_mode / OMBRE_MCP_AUTH_MODE
+    # "oauth"（默认）沿用上面的 OAuth 2.1 + PKCE；"token" 改走静态密钥（mcp_token / OMBRE_MCP_TOKEN）。
+    # 二者互斥——选 token 模式时 OAuth 的 discovery/register/authorize/token 路由全部 404（见 web/oauth.py）。
+    # 不能走 _apply_env_override：这里需要做枚举校验，非法值一律回退默认 "oauth"。
+    _raw_auth_mode = str(config.get("mcp_auth_mode", "oauth")).strip().lower()
+    config["mcp_auth_mode"] = _raw_auth_mode if _raw_auth_mode in ("oauth", "token") else "oauth"
+    _env_mcp_auth_mode = os.environ.get("OMBRE_MCP_AUTH_MODE", "").strip().lower()
+    if _env_mcp_auth_mode in ("oauth", "token"):
+        config["mcp_auth_mode"] = _env_mcp_auth_mode
+
+    _apply_env_override(config, "OMBRE_MCP_TOKEN", "mcp_token")
+
+    # 安全兜底：选了 token 模式却没配密钥——宁可继续用更强的 OAuth 兜底，也不要让用户
+    # 误以为已经开了保护、实际上 /mcp 会因校验函数拿不到密钥而被意外锁死或裸奔。
+    if config["mcp_auth_mode"] == "token" and not str(config.get("mcp_token") or "").strip():
+        logging.warning(
+            "mcp_auth_mode=token 但未配置 mcp_token / OMBRE_MCP_TOKEN，已自动回退为 oauth 模式 / "
+            "mcp_auth_mode=token but no mcp_token/OMBRE_MCP_TOKEN configured — falling back to oauth"
+        )
+        config["mcp_auth_mode"] = "oauth"
 
     # iter 1.9 F: 统一推荐 OMBRE_VAULT_DIR；老变量 OMBRE_BUCKETS_DIR 仍兼容
     # Priority: OMBRE_BUCKETS_DIR (legacy explicit) > OMBRE_VAULT_DIR > config.yaml.buckets_dir
@@ -215,11 +414,24 @@ def load_config(config_path: Optional[str] = None) -> dict:
         except Exception:
             pass
 
+    # 媒体必须和记忆一起落在持久卷；默认使用数据目录下独立的 _media。
+    # OMBRE_MEDIA_DIR 仅在确实挂载了另一块持久盘时覆盖。
+    media_dir = os.environ.get("OMBRE_MEDIA_DIR", "").strip()
+    config["media_dir"] = media_dir or os.path.join(str(config["buckets_dir"]), "_media")
+    try:
+        config["media_max_bytes"] = max(
+            1,
+            int(os.environ.get("OMBRE_MEDIA_MAX_BYTES", 25 * 1024 * 1024)),
+        )
+    except (TypeError, ValueError, OverflowError):
+        config["media_max_bytes"] = 25 * 1024 * 1024
+
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
     buckets_dir: str = str(config["buckets_dir"])
     for subdir in ["permanent", "dynamic", "archive"]:
         os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
+    os.makedirs(str(config["media_dir"]), exist_ok=True)
 
     return config
 
@@ -269,6 +481,56 @@ def _apply_env_override(config: dict, env_name: str, *path: str) -> None:
     for key in path[:-1]:
         cursor = cursor.setdefault(key, {})
     cursor[path[-1]] = value
+
+
+def positive_float(value, default: float) -> float:
+    """Parse a positive numeric config value, falling back to default."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(parsed) or parsed <= 0:
+        return float(default)
+    return parsed
+
+
+def _apply_env_float_override(config: dict, env_name: str, *path: str) -> None:
+    value = os.environ.get(env_name, "").strip()
+    if not value or not path:
+        return
+    try:
+        parsed = float(value)
+    except ValueError:
+        return
+    if not math.isfinite(parsed) or parsed <= 0:
+        return
+    cursor = config
+    for key in path[:-1]:
+        cursor = cursor.setdefault(key, {})
+    cursor[path[-1]] = int(parsed) if parsed.is_integer() else parsed
+
+
+def clean_llm_json(raw: str) -> str:
+    """Return the first complete JSON value from an LLM response.
+
+    Models sometimes wrap JSON in Markdown fences or add a short sentence before
+    or after it. Keep strict JSON validation in callers, but make the extraction
+    step tolerant enough to recover the balanced array/object.
+    """
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(cleaned):
+        if ch not in "[{":
+            continue
+        try:
+            _value, end = decoder.raw_decode(cleaned[idx:])
+        except json.JSONDecodeError:
+            continue
+        return cleaned[idx:idx + end].strip()
+    return cleaned
 
 
 def _resolve_log_dir(explicit: str | None) -> str:
@@ -445,6 +707,42 @@ def get_version() -> str:
     return "0.0.0+unknown"
 
 
+def get_ai_name() -> str:
+    """AI 一方的显示名 / display name for the AI side.
+
+    取自环境变量 `AI_NAME`，未设置或为空时回退到 "AI"。面向用户的文本
+    （prompt / UI / 错误信息）、letter 署名都用它，避免硬编码具体模型名。
+    Read from the `AI_NAME` env var; falls back to "AI" when unset/empty.
+    """
+    return os.environ.get("AI_NAME", "").strip() or "AI"
+
+
+def get_owner_name() -> str:
+    """当前实例记忆归属者的显示名 / display name of this instance's memory owner.
+
+    多人共用一套 OB 时，每个人跑一个独立实例（独立数据目录 + 端口），实例通过
+    环境变量 `OMBRE_OWNER_NAME` 标明「这份记忆是谁的」，供 Dashboard 顶部归属徽标
+    显示。未设置时回退空串（前端配合 owner_count 决定是否显示）。
+    只从进程环境读取，绝不写入共享的 .env——否则同码多实例会互相串名。
+    Read from the `OMBRE_OWNER_NAME` env var; empty when unset.
+    """
+    return os.environ.get("OMBRE_OWNER_NAME", "").strip()
+
+
+def get_owner_count() -> int:
+    """共用这套 OB 的总人数 / total number of people sharing this OB.
+
+    由启动器按配置的人数注入 `OMBRE_OWNER_COUNT`（手动部署时自行设置）。前端据此
+    决定是否显示归属徽标：`>= 2` 才显示（单人不打扰）。非法 / 未设置回退 1。
+    Read from the `OMBRE_OWNER_COUNT` env var; falls back to 1 when unset/invalid.
+    """
+    raw = os.environ.get("OMBRE_OWNER_COUNT", "").strip()
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
 def sanitize_name(name: str) -> str:
     """
     Sanitize bucket name, keeping only safe characters.
@@ -475,6 +773,41 @@ def safe_path(base_dir: str, filename: str) -> Path:
             f"{target} is not inside / 不在 {base} 内"
         )
     return target
+
+
+def _win_long_path(path: Path) -> str:
+    """Prefix an absolute path with ``\\\\?\\`` on Windows to bypass the 260-char
+    MAX_PATH limit. Domain names can sanitize down to 80 chars each, and nested
+    under a deep install/data dir the combined bucket path can exceed it. No-op
+    on other platforms."""
+    if os.name != "nt":
+        return str(path)
+    resolved = os.path.abspath(str(path))
+    if resolved.startswith("\\\\?\\"):
+        return resolved
+    if resolved.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + resolved[2:]
+    return "\\\\?\\" + resolved
+
+
+def atomic_write_text(path: str | Path, text: str) -> None:
+    """Atomically replace a UTF-8 text file after flushing it to disk."""
+    target = Path(path)
+    os.makedirs(_win_long_path(target.parent), exist_ok=True)
+    temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+    temporary_long = _win_long_path(temporary)
+    try:
+        with open(temporary_long, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_long, _win_long_path(target))
+    except Exception:
+        try:
+            os.remove(temporary_long)
+        except OSError:
+            pass
+        raise
 
 
 def count_tokens_approx(text: str) -> int:
