@@ -133,7 +133,6 @@ from typing import Any, Optional
 import frontmatter
 
 from utils import (
-    atomic_write_text,
     generate_bucket_id,
     sanitize_name,
     safe_path,
@@ -141,6 +140,30 @@ from utils import (
     parse_bool,
     parse_iso_datetime,
 )
+
+# Some installations reached VERSION 2.7.0 through an older partial updater:
+# ``bucket_manager.py`` was replaced but ``utils.py`` still predates the shared
+# atomic writer.  Keep startup compatible with those mixed installations while
+# preserving the same write-flush-replace safety contract.
+try:
+    from utils import atomic_write_text
+except ImportError:  # pragma: no cover - exercised only by mixed-version installs
+    def atomic_write_text(path: str | Path, text: str) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except Exception:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 from media_store import MediaStore
 from bucket_scoring import (
     calc_topic_score,

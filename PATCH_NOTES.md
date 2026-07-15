@@ -5,3 +5,5 @@ Apply this directory over an existing Ombre Brain 2.7.0 repository root. Do not 
 See the adjacent Chinese document `应用说明.md` in the delivery folder for deployment and safety instructions.
 
 Verification: 1130 passed, 45 skipped.
+
+Compatibility revision: `src/bucket_manager.py` includes an internal fallback for installations whose older `src/utils.py` does not yet export `atomic_write_text`.
