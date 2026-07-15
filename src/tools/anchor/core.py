@@ -12,8 +12,8 @@ pulse 顺带放在这里：它是系统状态 + 桶清单的总览，调用频�
 
 关键行为：
 - anchor_set / anchor_release：调 bucket_mgr.set_anchor，原样转译结果
-- pulse：聚合 stats + list_all，按 type 分组（normal/feel/plan/letter）
-  逐行展示 icon + 主题 + 情感 + 权重 + 标签
+- pulse：默认列全部核心桶 + 权重前 15 个普通桶；show_all=True 恢复全量，
+  按 type 分组并把统计放在末尾
 - pulse 同时附带「索引漂移」自检：embedding.db 的 ID 集合与磁盘桶 ID 集合
   对账，缺失/孤儿 > 0 时在状态块顶部告警，提示运行 backfill / clean 脚本
 
@@ -22,16 +22,21 @@ pulse 顺带放在这里：它是系统状态 + 桶清单的总览，调用频�
 - pulse 不做 dehydrate：只读元数据，避免大开销
 
 对外暴露：anchor_set(bucket_id) / anchor_release(bucket_id) /
-         pulse(include_archive) → str
+         pulse(include_archive, show_all) → str
 ========================================
 """
 
 from typing import Optional
 
 from .. import _runtime as rt
+from .._common import check_metadata_size
 
 
 async def anchor_set(bucket_id: str) -> str:
+    bucket_id = "" if bucket_id is None else str(bucket_id)
+    metadata_err = check_metadata_size(bucket_id=bucket_id)
+    if metadata_err:
+        return metadata_err
     if rt.mark_op:
         rt.mark_op("anchor")
     result = await rt.bucket_mgr.set_anchor(bucket_id, True)
@@ -43,6 +48,10 @@ async def anchor_set(bucket_id: str) -> str:
 
 
 async def anchor_release(bucket_id: str) -> str:
+    bucket_id = "" if bucket_id is None else str(bucket_id)
+    metadata_err = check_metadata_size(bucket_id=bucket_id)
+    if metadata_err:
+        return metadata_err
     if rt.mark_op:
         rt.mark_op("release")
     result = await rt.bucket_mgr.set_anchor(bucket_id, False)
@@ -53,7 +62,10 @@ async def anchor_release(bucket_id: str) -> str:
     return f"我把它从 anchor 移开了。它会重新参与默认浮现。当前 {result['count']}/{result['limit']}。"
 
 
-async def pulse(include_archive: Optional[bool] = False, show_all: Optional[bool] = False) -> str:
+async def pulse(
+    include_archive: Optional[bool] = False,
+    show_all: Optional[bool] = False,
+) -> str:
     if include_archive is None:
         include_archive = False
     if show_all is None:
@@ -69,8 +81,9 @@ async def pulse(include_archive: Optional[bool] = False, show_all: Optional[bool
         f"固化桶: {stats['permanent_count']} 个\n"
         f"动态桶: {stats['dynamic_count']} 个\n"
         f"归档桶: {stats['archive_count']} 个\n"
-        f"feel/plan/letter: {stats.get('feel_count', 0)}/"
-        f"{stats.get('plan_count', 0)}/{stats.get('letter_count', 0)} 条\n"
+        f"feel 桶: {stats.get('feel_count', 0)} 条\n"
+        f"plan 桶: {stats.get('plan_count', 0)} 条\n"
+        f"letter 桶: {stats.get('letter_count', 0)} 封\n"
         f"总占用: {stats['total_size_kb']:.1f} KB\n"
         f"衰减引擎: {'运行中' if rt.decay_engine.is_running else '已停止'}\n"
     )
@@ -81,17 +94,37 @@ async def pulse(include_archive: Optional[bool] = False, show_all: Optional[bool
     # 让她/他/模型立刻知道「数对不上是真 bug」而不是错觉。
     try:
         ee = getattr(rt, "embedding_engine", None)
+        outbox = getattr(rt.bucket_mgr, "embedding_outbox", None)
+        pending_ids = outbox.pending_ids() if outbox is not None else set()
+        if outbox is not None:
+            queue_state = outbox.status()
+            circuit = queue_state.get("circuit") or {}
+            status += (
+                f"向量索引队列: 待处理 {queue_state['pending']} 个"
+                f"（重试中 {queue_state['retrying']} 个）"
+                + (
+                    f"，供应商熔断中（连续失败 "
+                    f"{circuit.get('consecutive_failures', 0)} 次）"
+                    if circuit.get("state") == "open" else ""
+                )
+                + "\n"
+            )
         if ee and getattr(ee, "enabled", False):
             disk_buckets = await rt.bucket_mgr.list_all(include_archive=True)
-            disk_ids = {b["id"] for b in disk_buckets}
+            disk_ids = {
+                b["id"] for b in disk_buckets
+                if not (b.get("metadata") or {}).get("deleted_at")
+                and str(b.get("content") or "").strip()
+            }
             index_ids = set(ee.list_all_ids())
-            missing = disk_ids - index_ids
+            missing = disk_ids - index_ids - pending_ids
             orphan = index_ids - disk_ids
             if missing or orphan:
                 status += (
                     f"⚠️ 索引漂移：缺失 embedding {len(missing)} 个 / "
                     f"孤儿 embedding {len(orphan)} 个 "
-                    f"（运行 tools/backfill_embeddings.py 与 tools/clean_orphan_embeddings.py 可修复）\n"
+                    f"（缺失项可在 Dashboard 触发补齐；孤儿项可运行 "
+                    f"tools/clean_orphan_embeddings.py 清理）\n"
                 )
     except Exception as e:
         rt.logger.warning(f"pulse index/storage drift check failed: {e}")
@@ -104,23 +137,30 @@ async def pulse(include_archive: Optional[bool] = False, show_all: Optional[bool
     if not buckets:
         return status + "\n记忆库为空。"
 
-    # B2: show_all=False 时只显示钉选桶 + 按权重排序的前 15 个普通桶
-    # E5: 默认隐藏 dormant 桶
+    omitted = 0
     if not show_all:
-        pinned_b = [b for b in buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
-        normal_b = [b for b in buckets
-                    if not b["metadata"].get("pinned") and not b["metadata"].get("protected")
-                    and not b["metadata"].get("dormant", False)]
-        normal_b.sort(key=lambda b: rt.decay_engine.calculate_score(b["metadata"]), reverse=True)
-        buckets = pinned_b + normal_b[:15]
-        dormant_hidden = sum(1 for b_orig in (buckets if show_all else [])  # placeholder
-                             for _ in [None] if b_orig["metadata"].get("dormant", False))
-    dormant_total = 0
-    try:
-        all_b_tmp = await rt.bucket_mgr.list_all(include_archive=False)
-        dormant_total = sum(1 for b in all_b_tmp if b["metadata"].get("dormant", False))
-    except Exception:
-        pass
+        core_buckets = [
+            b for b in buckets
+            if b.get("metadata", {}).get("pinned")
+            or b.get("metadata", {}).get("protected")
+            or b.get("metadata", {}).get("type") == "permanent"
+        ]
+        core_ids = {b["id"] for b in core_buckets}
+        ordinary = [b for b in buckets if b["id"] not in core_ids]
+
+        def _score(bucket: dict) -> float:
+            try:
+                return float(rt.decay_engine.calculate_score(bucket.get("metadata", {})))
+            except Exception:
+                return 0.0
+
+        ordinary.sort(
+            key=_score,
+            reverse=True,
+        )
+        selected = core_buckets + ordinary[:15]
+        omitted = max(0, len(buckets) - len(selected))
+        buckets = selected
 
     normal_lines: list[str] = []
     feel_lines: list[str] = []
@@ -176,11 +216,7 @@ async def pulse(include_archive: Optional[bool] = False, show_all: Optional[bool
         else:
             normal_lines.append(line)
 
-    sections = [status]
-    if not show_all and dormant_total > 0:
-        sections[0] += f"休眠桶: {dormant_total} 个（pulse(show_all=True) 可查看全部）\n"
-    if not show_all:
-        sections[0] += "（已按权重显示钉选桶 + 前 15 条，pulse(show_all=True) 查看全部）\n"
+    sections = []
     if normal_lines:
         sections.append("=== 记忆列表 ===\n" + "\n".join(normal_lines))
     if plan_lines:
@@ -189,4 +225,7 @@ async def pulse(include_archive: Optional[bool] = False, show_all: Optional[bool
         sections.append(f"=== feel（{len(feel_lines)} 条）===\n" + "\n".join(feel_lines))
     if letter_lines:
         sections.append(f"=== 信件（{len(letter_lines)} 封）===\n" + "\n".join(letter_lines))
+    if omitted:
+        sections.append(f"还有 {omitted} 个非钉选桶未显示；使用 show_all=true 查看全部。")
+    sections.append(status.rstrip())
     return "\n\n".join(sections)

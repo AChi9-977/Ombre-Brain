@@ -28,12 +28,50 @@ log_level: "INFO"
 #    another auth layer at the reverse proxy — otherwise anyone can read/write memories.
 mcp_require_auth: true
 
+# --- MCP auth mode / MCP 鉴权模式（仅 mcp_require_auth: true 时生效）---
+# "oauth" (默认): 上面的 OAuth 2.1 + PKCE。
+# "token": 改用静态密钥鉴权，与 OAuth 互斥——选了 token 后 OAuth 的 discovery/register/
+#          authorize/token 路由全部 404。适合支持自定义请求头、但走不通浏览器 OAuth
+#          授权流程的第三方 MCP 客户端。密钥填在 mcp_token（或环境变量 OMBRE_MCP_TOKEN，
+#          优先级更高），也可用环境变量 OMBRE_MCP_AUTH_MODE=token 覆盖。
+# 调用方式：请求头 Authorization: Bearer <token> 或 Ombre-MCP-Token: <token>（不支持 URL 参数）。
+# "oauth" (default): OAuth 2.1 + PKCE above.
+# "token": switch to a static secret instead, mutually exclusive with OAuth — once selected,
+#          the OAuth discovery/register/authorize/token routes all 404. Useful for third-party
+#          MCP clients that support custom headers but can't complete browser OAuth. Set the
+#          secret via mcp_token (or env var OMBRE_MCP_TOKEN, which takes priority); env var
+#          OMBRE_MCP_AUTH_MODE=token also works.
+# Send it via header Authorization: Bearer <token> or Ombre-MCP-Token: <token> (no URL param).
+# ⚠️ 无论选 oauth / token / 关闭，都不要把服务直接暴露公网——Token 泄露等同任何人可读写全部记忆。
+# ⚠️ Regardless of mode, never expose this service directly to the public internet — a leaked
+#    token is equivalent to open read/write access to all memories.
+mcp_auth_mode: "oauth"
+mcp_token: ""
+
+# --- HTTP hooks auth / HTTP 钩子鉴权 ---
+# /breath-hook and /dream-hook are protected by default.
+# They accept the Dashboard login cookie, or this token via:
+#   ?token=...
+#   X-Ombre-Hook-Token: ...
+#   Authorization: Bearer ...
+# Set allow_public=true only behind another trusted auth layer.
+# /breath-hook 和 /dream-hook 默认不公开；可用 Dashboard 登录态或 token 调用。
+# 只有在反代层另有鉴权时，才建议显式打开 allow_public。
+hooks:
+  token: ""
+  allow_public: false
+
 # --- Bucket storage path / 记忆桶存储路径 ---
 # Point this to your Obsidian vault subdirectory, or any local folder
 # 指向你的 Obsidian 仓库子目录，或任意本地文件夹
 # Leave as-is to use the built-in ./buckets/ directory
 # 保持默认则使用内置的 ./buckets/ 目录
 # buckets_dir: "/path/to/your/Obsidian Vault/Ombre Brain"
+
+# Detect Markdown changes made outside OB (Obsidian / Git / manual edits).
+# Only file metadata is polled; Markdown is reparsed when a change is detected.
+storage:
+  external_change_poll_seconds: 1.0  # 0 = check every list; env: OMBRE_EXTERNAL_CHANGE_POLL_SECONDS
 
 # --- Merge threshold / 桶合并阈值 ---
 # When storing a new memory, if similarity with an existing bucket exceeds
@@ -62,6 +100,7 @@ dehydration:
   # api_key: ""    # ⚠️ Use env var OMBRE_COMPRESS_API_KEY instead / 请使用环境变量 OMBRE_COMPRESS_API_KEY
   max_tokens: 1024
   temperature: 0.1
+  timeout_seconds: 120             # LLM request timeout seconds / LLM 请求超时秒数
 
 # --- Decay parameters / 记忆衰减参数 ---
 # Simulates Ebbinghaus forgetting curve, auto-archives inactive memories
@@ -79,9 +118,16 @@ decay:
 # 需要在环境变量中设置 OMBRE_EMBED_API_KEY。
 embedding:
   enabled: true                   # Enable embedding / 启用向量化
+  background_indexing: true       # Write Markdown first; index asynchronously / 先落盘，后台生成向量
+  retry_base_seconds: 5           # First retry delay after provider failure / 首次重试等待
+  retry_max_seconds: 300          # Exponential-backoff ceiling / 指数退避上限
+  circuit_failure_threshold: 3    # Consecutive failures before global pause / 连续失败几次后熔断
+  circuit_base_seconds: 30        # First global cooldown / 首次熔断冷却
+  circuit_max_seconds: 600        # Maximum global cooldown / 最长熔断冷却
   backend: "api"                  # 只支持 api（OpenAI 兼容端点）
   model: "gemini-embedding-001"   # 云端模型名（如 gemini-embedding-001）
   base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  timeout_seconds: 120             # Embedding request timeout seconds / 向量化请求超时秒数
   # api_key: ""                   # Use OMBRE_EMBED_API_KEY / 使用 OMBRE_EMBED_API_KEY
 
 # --- Scoring weights / 检索权重参数 ---
@@ -98,12 +144,13 @@ matching:
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
 
 # --- Surfacing defaults / 浮现默认参数 ---
-# Defaults applied when Claude calls breath() without explicit caps.
+# Defaults applied when the AI calls breath() without explicit caps.
 # Front-end Settings panel writes the same fields back here.
-# Claude 调用 breath() 不显式传 max_* 时使用这些默认；前端「浮现默认参数」面板会回写到这里。
+# AI 调用 breath() 不显式传 max_* 时使用这些默认；前端「浮现默认参数」面板会回写到这里。
 surfacing:
-  breath_max_results: 20          # 1-50, hard cap of buckets returned per breath
+  breath_max_results: 5           # ordinary search/surfacing results; matching core buckets do not consume this quota
   breath_max_tokens: 10000        # 500-20000, total token cap per breath
+  dream_max_tokens: 6000          # 500-20000, supplemental dream blocks; explicit detail_ids keep full text
   feel_max_tokens: 6000           # 500-20000, full-text budget for feel history; older feels collapse to one-line summaries
   # iter 1.8: weighted sampling for breath surfacing mode（无参数浮现）
   # 加权采样：从 top_k 候选里按 score**(1/temperature) 抽 sample_k 个，让"想起"带轻微随机性。
@@ -120,6 +167,13 @@ surfacing:
 # 单桶字节上限 + pinned 桶数量上限。超出时在 hold/grow/trace 入口直接拒绝。
 limits:
   max_bucket_bytes: 51200         # 50KB; 0 disables check
+  max_import_upload_bytes: 67108864  # 64MB conversation import request cap
+  max_mcp_request_bytes: 4194304  # 4MB HTTP body cap for /mcp; 0 disables
+  max_management_request_bytes: 4194304  # 4MB cap for Dashboard/OAuth mutations; large import routes use their own caps
+  max_grow_input_bytes: 2097152   # 2MB total grow source/items cap; 0 disables
+  max_query_bytes: 16384          # 16KB breath/letter query cap; 0 disables
+  max_metadata_bytes: 16384       # combined tool metadata/filter cap; 0 disables
+  max_grow_items: 100             # pre-split/digest item count cap; 0 disables
   max_pinned: 20                  # max pinned buckets; 0 disables check
 
 # --- iter 1.9 G: 桶类型默认值 / per-type frontmatter defaults ---
@@ -133,12 +187,6 @@ bucket_type_defaults:
   plan:
     weight: 0.5
 
-# --- Obsidian wikilinks / Obsidian 双链自动注入 ---
-wikilink:
-  enabled: true
-  use_tags: false
-  use_domain: true
-  use_auto_keywords: true
-  auto_top_k: 4
-  min_keyword_len: 3
-  exclude_keywords: []
+# --- Deprecated: Obsidian wikilinks auto injection / 已废弃 ---
+# wikilink 自动注入已禁用；OB 只读取正文里的 [[wikilink]] 做网络图。
+# 旧版 config.yaml 中残留的 wikilink.* 配置会被忽略。
