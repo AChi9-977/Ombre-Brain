@@ -972,11 +972,19 @@ if __name__ == "__main__":
             # Explicit IPv4 avoids localhost resolving to ::1 in Proot/Termux.
             keepalive_url=f"http://127.0.0.1:{OMBRE_PORT}/health",
         )
-        _mcp_token_validator = (
-            _is_valid_static_mcp_token
-            if _http_settings.auth_mode == "token"
-            else _is_valid_mcp_token
-        )
+        def _is_valid_mcp_token_either(token: str, resource: str = "") -> bool:
+            """both 模式：静态 token 与 OAuth token 任一通过即放行。
+            先验静态（常数时间比较、无 IO），失败再走 OAuth 存储查验。"""
+            return _is_valid_static_mcp_token(token, resource=resource) or _is_valid_mcp_token(
+                token, resource=resource
+            )
+
+        if _http_settings.auth_mode == "token":
+            _mcp_token_validator = _is_valid_static_mcp_token
+        elif _http_settings.auth_mode == "both":
+            _mcp_token_validator = _is_valid_mcp_token_either
+        else:
+            _mcp_token_validator = _is_valid_mcp_token
         _app = build_http_app(
             mcp,
             transport,
@@ -1007,6 +1015,14 @@ if __name__ == "__main__":
                 "    直接暴露到公网，仅在可信内网或自带鉴权的隧道场景使用，并妥善保管、\n"
                 "    定期轮换该 Token。\n"
                 + "=" * 60
+            )
+        elif _mcp_auth_required and _http_settings.auth_mode == "both":
+            logger.info(
+                "MCP 双模式鉴权已启用：OAuth 端点照常 + 静态 Token 同时有效 / "
+                "MCP dual-mode auth enabled (OAuth endpoints on, static token also accepted)"
+            )
+            logger.warning(
+                "⚠️  both 模式下静态 Token 仍等同万能密钥，请妥善保管、定期轮换。"
             )
         elif _mcp_auth_required:
             logger.info("MCP OAuth middleware enabled / MCP OAuth 中间件已启用")

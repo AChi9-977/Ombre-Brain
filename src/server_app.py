@@ -73,7 +73,7 @@ class HTTPRuntimeSettings:
             DEFAULT_MAX_MANAGEMENT_REQUEST_BYTES,
         )
         auth_mode = str(config.get("mcp_auth_mode", "oauth")).strip().lower()
-        if auth_mode not in ("oauth", "token"):
+        if auth_mode not in ("oauth", "token", "both"):
             auth_mode = "oauth"
         return cls(
             auth_required=parse_bool(
@@ -131,7 +131,7 @@ class MCPAuthMiddleware:
         self.app = app
         self.auth_required = bool(auth_required)
         self.token_validator = token_validator
-        self.auth_mode = auth_mode if auth_mode in ("oauth", "token") else "oauth"
+        self.auth_mode = auth_mode if auth_mode in ("oauth", "token", "both") else "oauth"
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         path = str(scope.get("path", ""))
@@ -146,7 +146,7 @@ class MCPAuthMiddleware:
             valid = auth.startswith("Bearer ") and self.token_validator(
                 auth[7:], resource=resource
             )
-            if not valid and self.auth_mode == "token":
+            if not valid and self.auth_mode in ("token", "both"):
                 # Fallback header for MCP clients that can't customize Authorization.
                 alt_token = headers.get(b"ombre-mcp-token", b"").decode(
                     "latin-1"

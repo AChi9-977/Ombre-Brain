@@ -66,14 +66,17 @@ _FORBIDDEN_REDIRECT_SCHEMES = {
 def _oauth_required_from_config() -> bool:
     """Snapshot the effective MCP auth mode used for this server process.
 
-    OAuth and the static-token mode (mcp_auth_mode: "token") are mutually
-    exclusive: when token mode is selected, every OAuth discovery/register/
-    authorize/token route below 404s via _oauth_not_found(), same as when
-    mcp_require_auth is false outright.
+    OAuth routes are live in "oauth" and "both" modes. Only the pure
+    static-token mode (mcp_auth_mode: "token") turns them off: every OAuth
+    discovery/register/authorize/token route below 404s via
+    _oauth_not_found(), same as when mcp_require_auth is false outright.
+    "both" keeps OAuth for clients that can't send a custom Bearer header
+    (e.g. claude.ai connectors) while the middleware also accepts the
+    static token (see server.py validator selection).
     """
     return (
         parse_bool(sh.config.get("mcp_require_auth", True), default=True)
-        and str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower() == "oauth"
+        and str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower() in ("oauth", "both")
     )
 
 
