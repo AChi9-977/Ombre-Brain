@@ -27,6 +27,8 @@ import asyncio
 import logging
 from datetime import datetime
 
+from utils import parse_iso_datetime
+
 logger = logging.getLogger("ombre_brain.decay")
 
 
@@ -51,6 +53,11 @@ _DEFAULT_AROUSAL_BOOST = 0.8      # arousal 每 +1 → 情感权重 +0.8
 # --- 锁分：某些桶不参与衰减 ---
 _SCORE_PINNED = 999.0    # pinned / protected / permanent 桶恒高分（永不归档）
 _SCORE_FEEL = 50.0       # feel / plan / letter 桶固定中分（生命周期由 status 控制）
+
+# --- 周期自愈：每轮衰减最多补多少条缺失向量（防一次性打爆 embedding API）---
+# 活跃桶落盘了但 embeddings.db 没它的向量 → breath 向量通道会漏掉它（permanent
+# 尤其常见，见 #6）。剩余的下一轮继续补。
+_BACKFILL_MAX_PER_CYCLE = 50
 
 # --- Freshness bonus：bonus = 1 + e^(-hours/HALF_LIFE) ---
 _FRESHNESS_HALF_LIFE_HRS = 36.0  # 36h 半衰：刚存 ×2.0，36h 后 ×1.5，72h 后 ≈×1.14
@@ -107,7 +114,7 @@ def _days_since_active(meta: dict, fallback_days: float = _DEFAULT_DAYS_FALLBACK
         return fallback_days
     raw = meta.get("last_active") or meta.get("created") or ""
     try:
-        last_active = datetime.fromisoformat(str(raw))
+        last_active = parse_iso_datetime(raw)
         return max(0.0, (datetime.now() - last_active).total_seconds() / _SECONDS_PER_DAY)
     except (ValueError, TypeError):
         return float(fallback_days)
@@ -287,41 +294,22 @@ class DecayEngine:
         checked = 0
         archived = 0
         auto_resolved = 0
-        auto_dormant = 0
         lowest_score = float("inf")
-
-        # E5: dormant 阈值常量
-        _DORMANT_IMPORTANCE_MAX = 2   # importance < 3
-        _DORMANT_DAYS_MIN = 30
 
         demoted_orphans = 0
         for bucket in buckets:
             meta = bucket.get("metadata", {})
 
-            # --- Self-heal: 孤儿固化桶（type==permanent 却没 pinned/protected）---
-            # 早期 unpin 只翻 pinned 标记、没把 type 降级回 dynamic 的历史遗留。这类桶
-            # calculate_score 恒返 999（权重卡死、永不衰减、永远霸占召回置顶），还占着
-            # permanent_count。她/他在前端面板里看不到它们（pinned=False 显示为未钉选，
-            # 点开关只会把它重新钉上，够不着），唯一的出口就是这里。后台衰减循环每 N 小时
-            # 扫全库，顺手把孤儿对称降级回 dynamic：复用 update(pinned=False) 那条已测过的
-            # 「取消钉选→降级」路径（type→dynamic、移回 dynamic/）。降级后本轮先跳过，
-            # 下一轮它就是普通 dynamic 桶、按 importance 算出正常权重并参与衰减。
-            if meta.get("type") == "permanent" and not meta.get("pinned") and not meta.get("protected"):
-                try:
-                    await self.bucket_mgr.update(bucket["id"], pinned=False)
-                    demoted_orphans += 1
-                    logger.info(
-                        f"Decay self-heal / 自愈降级孤儿固化桶: "
-                        f"{meta.get('name', bucket['id'])} ({bucket['id']})"
-                    )
-                except Exception as e:
-                    logger.warning(f"Decay self-heal failed / 自愈降级失败 {bucket.get('id', '?')}: {e}")
-                continue
-
-            # Skip permanent / pinned / protected / feel / i buckets
+            # Skip permanent / pinned / protected / feel / i / plan / letter buckets
             # 跳过固化桶、钉选/保护桶、feel 桶和 i（自我认知）桶
             # i 桶承诺永不衰减（tools/i/core.py 注释）——必须在此显式排除
-            if meta.get("type") in ("permanent", "feel", "i") or meta.get("pinned") or meta.get("protected"):
+            # plan / letter 同样必须在此排除：calculate_score() 对它们恒定返回
+            # _SCORE_FEEL，本来就不会被下面的归档阈值判定动到，但下面的自动结案
+            # 分支跑在 calculate_score() 之前、不看 type，会直接把 plan/letter
+            # 也 resolved=True——plan 的生命周期只能由 status 字段驱动，letter
+            # 承诺永久保留原样，两者都不该被这条「重要度低+超期未解决」的通用
+            # 自动结案逻辑碰。
+            if meta.get("type") in ("permanent", "feel", "i", "plan", "letter") or meta.get("pinned") or meta.get("protected"):
                 continue
 
             checked += 1
@@ -346,26 +334,6 @@ class DecayEngine:
                         )
                     except Exception as e:
                         logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
-
-            # E5: dormant 标记 — importance<3 且 30天未访问 且未钉选 → 标 dormant
-            if (
-                not meta.get("dormant", False)
-                and not meta.get("pinned")
-                and not meta.get("protected")
-                and int(meta.get("importance") or _DEFAULT_IMPORTANCE) <= _DORMANT_IMPORTANCE_MAX
-            ):
-                days_d = _days_since_active(meta, fallback_days=_DORMANT_DAYS_MIN + 1)
-                if days_d > _DORMANT_DAYS_MIN:
-                    try:
-                        await self.bucket_mgr.update(bucket["id"], dormant=True)
-                        auto_dormant += 1
-                        logger.info(
-                            f"Auto-dormant / 自动休眠: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(imp={int(meta.get('importance') or _DEFAULT_IMPORTANCE)}, days={days_d:.0f})"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Auto-dormant failed: {e}")
 
             try:
                 score = self.calculate_score(meta)
@@ -396,15 +364,74 @@ class DecayEngine:
                         f"归档失败: {e}"
                     )
 
+        # --- Self-heal: 补齐缺失向量（周期性，详见 _self_heal_embeddings）---
+        backfilled_embeddings = await self._self_heal_embeddings(buckets)
+
         result = {
             "checked": checked,
             "archived": archived,
             "auto_resolved": auto_resolved,
-            "auto_dormant": auto_dormant,
+            "demoted_orphans": demoted_orphans,
+            "backfilled_embeddings": backfilled_embeddings,
             "lowest_score": lowest_score if checked > 0 else 0,
         }
         logger.info(f"Decay cycle complete / 衰减周期完成: {result}")
         return result
+
+    async def _self_heal_embeddings(self, buckets: list) -> int:
+        """周期自愈：给「落盘了但 embeddings.db 里没向量」的活跃桶补向量。
+
+        背景（#6）：permanent 桶常因批量导入 / dashboard 钉选而漏建向量，
+        breath 的向量通道就检索不到它们，表现为「只读得到 dynamic」。衰减循环
+        每轮顺手补齐，无需人工跑 backfill_embeddings.py。
+
+        边界：embedding 未启用 → 跳过；每轮最多补 _BACKFILL_MAX_PER_CYCLE 条
+        （防打爆 API），剩余下一轮继续；单条失败仅 warning（rule.md §1.5 允许降级）。
+        只处理活跃桶（buckets 不含 archive），不在此删孤儿向量（删除走专用脚本，
+        避免把 archive 桶的有效向量误判为孤儿）。"""
+        outbox = getattr(self.bucket_mgr, "embedding_outbox", None)
+        if outbox is not None and getattr(outbox, "running", False):
+            try:
+                queued = await outbox.reconcile(
+                    buckets=buckets,
+                    include_archive=False,
+                )
+                if queued:
+                    logger.info(
+                        "Decay self-heal queued / 衰减自愈已加入向量队列: %s 条",
+                        queued,
+                    )
+                return queued
+            except Exception as e:
+                logger.warning(f"self-heal embeddings: 投递后台队列失败: {e}")
+                return 0
+
+        ee = getattr(self.bucket_mgr, "embedding_engine", None)
+        if not ee or not getattr(ee, "enabled", False):
+            return 0
+        try:
+            index_ids = set(ee.list_all_ids())
+        except Exception as e:
+            logger.warning(f"self-heal embeddings: 读取向量索引失败: {e}")
+            return 0
+        missing = [b for b in buckets if b["id"] not in index_ids and (b.get("content") or "").strip()]
+        if not missing:
+            return 0
+        healed = 0
+        for b in missing[:_BACKFILL_MAX_PER_CYCLE]:
+            try:
+                if await ee.generate_and_store(b["id"], b["content"]):
+                    healed += 1
+            except Exception as e:
+                logger.warning(f"self-heal embeddings: 补 {b['id']} 失败: {e}")
+        if healed:
+            remaining = len(missing) - healed
+            logger.info(
+                f"Decay self-heal / 自愈补向量: {healed} 条"
+                + (f"（本轮上限 {_BACKFILL_MAX_PER_CYCLE}，剩 {remaining} 下轮继续）"
+                   if remaining > 0 else "")
+            )
+        return healed
 
     # ---------------------------------------------------------
     # Background decay task management

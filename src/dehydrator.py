@@ -27,6 +27,7 @@ tools/dream 等都通过它来「让模型做内容理解」，自身不直接�
 import os
 import re
 import json
+import asyncio
 import hashlib
 import sqlite3
 import logging
@@ -34,7 +35,15 @@ from typing import Optional
 
 from openai import AsyncOpenAI
 
-from utils import count_tokens_approx
+from utils import clean_llm_json, count_tokens_approx, parse_bool, positive_float
+
+try:
+    from provider_detect import is_gemini_native_host, strip_native_resource_prefix
+except ImportError:  # pragma: no cover
+    from .provider_detect import (  # type: ignore
+        is_gemini_native_host,
+        strip_native_resource_prefix,
+    )
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -49,7 +58,8 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 # --- 脱水缓存版本号 ---
 # 改任何会影响脱水/合并输出的 prompt 时 +1，使存量缓存自然失效（见 _content_key）。
 # v2：DEHYDRATE/MERGE 加入「视角铁律」，强制保留第一人称（我 / 人名）。
-_PROMPT_VERSION = 2
+# v3：脱水结果只接受既定 JSON schema，隔离模型追加的评论、立场与未知字段。
+_PROMPT_VERSION = 3
 
 # --- LLM 默认参数 ---
 _DEFAULT_MODEL = "gemini-2.0-flash"
@@ -57,6 +67,17 @@ _DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 _DEFAULT_MAX_TOKENS = 1024
 _DEFAULT_TEMPERATURE = 0.1
 _API_TIMEOUT_SECONDS = 60.0
+
+# --- 瞬时错误重试（Gemini 免费层偶发 429 / 503，详见 README 故障表）---
+# 总尝试 = 1 次初始 + (max_attempts-1) 次重试；退避 base*2^attempt 秒。
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 0.8
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+# --- 脱水 API 最终失败时的本地降级：返回原文截断片段的字符上限 ---
+# 设计：API（含重试）彻底失败时，宁可返回未压缩的原文片段，也不让上层
+# breath/dream 拿不到内容（rule.md §1.5 允许降级）。不写缓存，API 恢复后自动重压。
+_DEHYDRATE_FALLBACK_CHARS = 300
 
 # --- 该多长才需要压缩（低于该 token 数直接走原文）---
 _DEHYDRATE_MIN_TOKENS = 100
@@ -124,6 +145,8 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 4. 关键数字、日期、名称必须保留
 5. 目标压缩率 > 70%
 6. 严格保留第一人称视角（见下方视角铁律）
+7. 只输出摘要 JSON，JSON 结束后立即停止；禁止附加自己的评论与立场、解释、道德判断、合规声明或角色代入
+8. 只复述输入中明确存在的信息，不得生成原文中不存在的观点、结论或待办
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -247,6 +270,7 @@ class Dehydrator:
         self.base_url = dehy_cfg.get("base_url", _DEFAULT_BASE_URL)
         self.max_tokens = dehy_cfg.get("max_tokens", _DEFAULT_MAX_TOKENS)
         self.temperature = dehy_cfg.get("temperature", _DEFAULT_TEMPERATURE)
+        self.timeout_seconds = positive_float(dehy_cfg.get("timeout_seconds"), _API_TIMEOUT_SECONDS)
         # api_format: "openai_compat" (default) | "gemini" | "anthropic"
         self.api_format = dehy_cfg.get("api_format", "openai_compat")
         # Auto-detect new Google AI Studio key format (AQ.*): these keys are not accepted
@@ -255,7 +279,7 @@ class Dehydrator:
         if (
             self.api_format == "openai_compat"
             and self.api_key.startswith("AQ.")
-            and "generativelanguage.googleapis.com" in (self.base_url or "")
+            and is_gemini_native_host(self.base_url)
         ):
             self.api_format = "gemini"
             logger.info("AQ.* key + generativelanguage.googleapis.com detected — auto-switching to native Gemini API")
@@ -282,7 +306,7 @@ class Dehydrator:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                timeout=_API_TIMEOUT_SECONDS,
+                timeout=self.timeout_seconds,
             )
 
         # --- SQLite dehydration cache ---
@@ -309,13 +333,16 @@ class Dehydrator:
         return conn
 
     def _content_key(self, content: str) -> str:
-        """缓存键 = hash(prompt 版本 + 人名 + 原文)。
+        """缓存键 = hash(prompt 版本 + 人名 + 模型配置 + 原文)。
 
         缓存原本只按 content_hash 存，导致脱水 prompt 改了、人名改了，旧的
         third-person 摘要仍会命中缓存返回——视角修复对存量内容不生效。把
-        _PROMPT_VERSION 与 self.human 混进 key，prompt 一升级就自然绕过旧缓存，
-        无需手工删 dehydration_cache.db。"""
-        keyed = f"{_PROMPT_VERSION}|{self.human}|{content}"
+        prompt 版本、人名、api_format、base_url 和 model 混进 key，换模型或端点后
+        下次 breath 会用新配置重新脱水，不会复用旧模型的摘要。"""
+        keyed = (
+            f"{_PROMPT_VERSION}|{self.human}|{self.api_format}|"
+            f"{self.base_url.rstrip('/')}|{self.model}|{content}"
+        )
         return hashlib.sha256(keyed.encode()).hexdigest()
 
     def _get_cached_summary(self, content: str) -> str | None:
@@ -354,7 +381,55 @@ class Dehydrator:
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
 
+    @staticmethod
+    def _is_transient_error(exc: BaseException) -> bool:
+        """是否为可重试的瞬时错误：HTTP 429/500/502/503/504、超时、连接错误。
+
+        兼容 httpx.HTTPStatusError（status_code 在 .response 上）与
+        openai.APIStatusError（status_code 在异常上）；其余按类名兜底匹配
+        timeout / connect / ratelimit / unavailable。"""
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            resp = getattr(exc, "response", None)
+            status = getattr(resp, "status_code", None)
+        if isinstance(status, int) and status in _RETRY_STATUS:
+            return True
+        name = type(exc).__name__.lower()
+        return any(k in name for k in ("timeout", "connect", "ratelimit", "unavailable"))
+
     async def _chat(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        """统一 chat 入口：对 429 / 5xx / 超时等瞬时错误做指数退避重试。
+
+        真正的单次调用在 _chat_once；这里只负责重试与退避，让 Gemini 免费层
+        偶发的 429/503 不至于直接把脱水/合并打挂（见 README 故障表）。"""
+        last_exc: BaseException | None = None
+        for attempt in range(_RETRY_MAX_ATTEMPTS):
+            try:
+                return await self._chat_once(
+                    system, user, max_tokens=max_tokens, temperature=temperature
+                )
+            except Exception as e:
+                if not self._is_transient_error(e) or attempt == _RETRY_MAX_ATTEMPTS - 1:
+                    raise
+                last_exc = e
+                delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    f"_chat 瞬时错误，{delay:.1f}s 后重试 "
+                    f"({attempt + 1}/{_RETRY_MAX_ATTEMPTS}): {type(e).__name__}: {e}"
+                )
+                await asyncio.sleep(delay)
+        if last_exc is not None:
+            raise last_exc
+        return ""
+
+    async def _chat_once(
         self,
         system: str,
         user: str,
@@ -414,7 +489,7 @@ class Dehydrator:
             return ""
         import httpx
         # Strip any accidental "models/" prefix — Google rejects double-prefix in the URL
-        model_id = self.model.removeprefix("models/").strip()
+        model_id = strip_native_resource_prefix(self.model)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
         payload: dict = {
             "system_instruction": {"parts": [{"text": system}]},
@@ -427,7 +502,7 @@ class Dehydrator:
         # 关闭/限制思考预算（见 __init__ 的 thinking_budget 说明）。
         if self.thinking_budget is not None:
             payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": self.thinking_budget}
-        async with httpx.AsyncClient(timeout=_API_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             r = await client.post(url, params={"key": self.api_key}, json=payload)
             r.raise_for_status()
         data = r.json()
@@ -463,7 +538,7 @@ class Dehydrator:
             "messages": [{"role": "user", "content": user}],
             "temperature": temperature if temperature is not None else self.temperature,
         }
-        async with httpx.AsyncClient(timeout=_API_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
         data = r.json()
@@ -475,16 +550,8 @@ class Dehydrator:
 
     @staticmethod
     def _strip_md_fence(raw: str) -> str:
-        """剥掉 LLM 偶尔会包的 ```...``` 代码块外壳。
-
-        DeepSeek / Gemini 在被要求"返回纯 JSON"时仍偶尔把 JSON 包进
-        ```json\n{...}\n``` 里。三处 JSON 解析都得做这层剥离，
-        所以统一抽到这里。原始字符串不含围栏时原样返回。
-        """
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-        return cleaned
+        """Backwards-compatible wrapper for tolerant LLM JSON extraction."""
+        return clean_llm_json(raw)
 
     @staticmethod
     def _clamp_va(
@@ -504,6 +571,42 @@ class Dehydrator:
         except (ValueError, TypeError):
             return default_v, default_a
 
+    @staticmethod
+    def _normalize_dehydration_result(raw: str) -> str:
+        """Validate and canonicalize the model response before it crosses the cache boundary.
+
+        Some models return a valid dehydration object and then append a first-person
+        policy or stance statement. Extracting the first JSON value is not enough on
+        its own because a model can also invent extra top-level fields, so rebuild the
+        payload from the documented schema. Content inside a documented field is not
+        heuristically censored: doing that could silently delete a real memory fact.
+        """
+        try:
+            parsed = json.loads(clean_llm_json(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("脱水模型未返回有效 JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("脱水模型返回的 JSON 顶层必须是对象")
+
+        def string_list(field: str) -> list[str]:
+            value = parsed.get(field, [])
+            if not isinstance(value, list):
+                return []
+            return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+        summary = parsed.get("summary", "")
+        emotion_state = parsed.get("emotion_state", "")
+        normalized = {
+            "core_facts": string_list("core_facts"),
+            "emotion_state": emotion_state.strip() if isinstance(emotion_state, str) else "",
+            "todos": string_list("todos"),
+            "keywords": string_list("keywords"),
+            "summary": summary.strip() if isinstance(summary, str) else "",
+        }
+        if not normalized["summary"] and not normalized["core_facts"]:
+            raise ValueError("脱水结果缺少 summary 和 core_facts")
+        return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
     # ---------------------------------------------------------
     # Dehydrate: compress raw content into concise summary
     # 脱水：将原始内容压缩为精简摘要
@@ -513,10 +616,10 @@ class Dehydrator:
     async def dehydrate(self, content: str, metadata: Optional[dict] = None) -> str:
         """
         Dehydrate/compress memory content.
-        Returns formatted summary string ready for Claude context injection.
+        Returns formatted summary string ready for LLM context injection.
         Uses SQLite cache to avoid redundant API calls.
         对记忆内容做脱水压缩。
-        返回格式化的摘要字符串，可直接注入 Claude 上下文。
+        返回格式化的摘要字符串，可直接注入 LLM 上下文。
         使用 SQLite 缓存避免重复调用 API。
         """
         if not content or not content.strip():
@@ -531,13 +634,38 @@ class Dehydrator:
         # --- 先查缓存 ---
         cached = self._get_cached_summary(content)
         if cached:
-            return self._format_output(cached, metadata)
+            try:
+                normalized = self._normalize_dehydration_result(cached)
+            except ValueError:
+                # A malformed cache entry must never be surfaced as memory content.
+                self.invalidate_cache(content)
+                logger.warning("discarded invalid dehydration cache entry")
+            else:
+                # Self-heal parseable entries such as `JSON + trailing commentary`.
+                if normalized != cached:
+                    self._set_cached_summary(content, normalized)
+                return self._format_output(normalized, metadata)
 
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
         self._require_api()
 
-        result = await self._api_dehydrate(content)
+        try:
+            raw_result = await self._api_dehydrate(content)
+            result = self._normalize_dehydration_result(raw_result)
+        except Exception as e:
+            # --- 本地降级：API（已含重试）彻底失败时，返回原文截断片段而非抛异常。---
+            # 让 breath/dream 在 Gemini 抽风时仍能拿到内容（只是没压缩）；不写缓存，
+            # API 恢复后下次自然重新压缩。
+            logger.warning(
+                f"dehydrate API failed, falling back to truncated raw content / "
+                f"脱水 API 失败，降级返回原文截断: {type(e).__name__}: {e}"
+            )
+            stripped = content.strip()
+            snippet = stripped[:_DEHYDRATE_FALLBACK_CHARS].rstrip()
+            if len(stripped) > _DEHYDRATE_FALLBACK_CHARS:
+                snippet += "…（原文截断·脱水暂不可用）"
+            return self._format_output(snippet, metadata)
         # --- Cache the result ---
         self._set_cached_summary(content, result)
         return self._format_output(result, metadata)
@@ -616,7 +744,23 @@ class Dehydrator:
             name = metadata.get("name", "未命名")
             domains = ", ".join(metadata.get("domain", []))
             valence, arousal = self._clamp_va(metadata)
-            header = f"📌 记忆桶: {name}"
+            # 图标语义与 pulse 一致：📌 只给钉住/保护的核心桶，其余按类型区分，
+            # 普通动态桶用 💭。此前无条件用 📌 会让 breath 浮现里每条都像「核心准则」，
+            # 与 docs/CLAUDE_PROMPT.md「带 📌 的是我钉的核心准则」的约定冲突。
+            _btype = metadata.get("type")
+            if metadata.get("pinned") or metadata.get("protected"):
+                _icon = "📌"
+            elif _btype == "permanent":
+                _icon = "📦"
+            elif _btype == "feel":
+                _icon = "🫧"
+            elif _btype == "plan":
+                _icon = "📋"
+            elif _btype == "letter":
+                _icon = "💌"
+            else:
+                _icon = "💭"
+            header = f"{_icon} 记忆桶: {name}"
             if domains:
                 header += f" [主题:{domains}]"
             header += f" [情感:V{valence:.1f}/A{arousal:.1f}]"
@@ -631,16 +775,43 @@ class Dehydrator:
                 header += " [已消化]"
             header += "\n"
 
-        # 去掉 keywords 字段：LLM 返回的 JSON 里 keywords 是内部索引用途，不暴露给上下文
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, dict) and "keywords" in parsed:
-                parsed.pop("keywords", None)
-                content = json.dumps(parsed, ensure_ascii=False)
-        except Exception:
-            pass  # 非 JSON 内容直接透传
+        # 脱水结果可能是结构化 JSON（core_facts/emotion_state/todos/keywords/summary）。
+        # 渲染成可读文本，而不是把整坨原始 JSON 塞进上下文——后者又丑又费 token，且与
+        # 短内容「原文透传」的形态不一致（长桶显示 JSON、短桶显示纯文本）。
+        content = self._render_dehydrated(content)
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
         return f"{header}{content}"
+
+    @staticmethod
+    def _render_dehydrated(content: str) -> str:
+        """把脱水 LLM 返回的结构化 JSON 渲染成可读文本。
+
+        识别到 core_facts/summary schema → 输出 summary + 核心事实 + 待办（丢弃仅供
+        内部索引的 keywords、以及已由情感坐标承载的 emotion_state）。非该 schema 的
+        内容（如短内容直接透传的原文、或普通字符串）原样返回。
+        """
+        try:
+            parsed = json.loads(content)
+        except (ValueError, TypeError):
+            return content  # 非 JSON，原样透传
+        if not isinstance(parsed, dict) or ("summary" not in parsed and "core_facts" not in parsed):
+            return content  # 不是脱水 schema，原样透传
+
+        lines: list[str] = []
+        summary = str(parsed.get("summary") or "").strip()
+        facts = [str(f).strip() for f in (parsed.get("core_facts") or []) if str(f).strip()]
+        if summary:
+            lines.append(summary)
+        elif facts:
+            # 没有 summary 时，用核心事实兜底成正文，避免只剩空壳
+            lines.append("；".join(facts))
+            facts = []
+        for f in facts:
+            lines.append(f"· {f}")
+        todos = [str(t).strip() for t in (parsed.get("todos") or []) if str(t).strip()]
+        if todos:
+            lines.append("待办：" + "；".join(todos))
+        return "\n".join(lines) if lines else content
 
     # ---------------------------------------------------------
     # Auto-tagging: analyze content for domain + emotion + tags
@@ -862,7 +1033,7 @@ class Dehydrator:
             cleaned = self._strip_md_fence(raw)
             data = json.loads(cleaned)
             return {
-                "resolved": bool(data.get("resolved", False)),
+                "resolved": parse_bool(data.get("resolved", False), default=False),
                 "confidence": float(data.get("confidence", 0.0)),
                 "reason": str(data.get("reason", ""))[:_PLAN_REASON_MAX],
             }
