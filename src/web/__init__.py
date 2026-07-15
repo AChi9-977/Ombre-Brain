@@ -32,6 +32,8 @@ from . import ollama_local
 from . import config_api
 from . import onboarding
 from . import v3_debug
+from . import desire
+from . import timeline
 
 
 _WEB_MODULES = (
@@ -53,6 +55,8 @@ _WEB_MODULES = (
     ("web.config_api", config_api.register),
     ("web.onboarding", onboarding.register),
     ("web.v3_debug", v3_debug.register),
+    ("web.desire", desire.register),
+    ("web.timeline", timeline.register),
 )
 
 

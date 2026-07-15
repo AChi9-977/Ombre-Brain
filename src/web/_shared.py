@@ -121,6 +121,7 @@ import_engine = None
 migrate_engine = None
 github_sync_instance = None
 v3_runtime = None
+desire_runtime = None
 
 
 def init(cfg: dict) -> None:

@@ -330,6 +330,7 @@ class RuntimeLifecycle:
     logger: Any
     decay_engine: Any = None
     embedding_outbox: Any = None
+    desire_runtime: Any = None
     ensure_ollama_child: AsyncCallback | None = None
     stop_ollama_child: AsyncCallback | None = None
     load_tunnel_config: Callable[[], Mapping[str, Any]] | None = None
@@ -409,6 +410,11 @@ class RuntimeLifecycle:
             "embedding outbox start",
             getattr(self.embedding_outbox, "start", None),
         )
+        # 欲望心跳与 decay 同级：开机即跳，不等首个工具调用
+        await self._run_async_step(
+            "desire heartbeat start",
+            getattr(self.desire_runtime, "start", None),
+        )
         if self.keepalive_url:
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(),
@@ -434,6 +440,10 @@ class RuntimeLifecycle:
             except Exception as exc:
                 self.logger.warning("github auto-sync stop failed: %s", exc)
 
+        await self._run_async_step(
+            "desire heartbeat stop",
+            getattr(self.desire_runtime, "stop", None),
+        )
         await self._run_async_step(
             "embedding outbox stop",
             getattr(self.embedding_outbox, "stop", None),

@@ -64,6 +64,7 @@ from tools import anchor as _t_anchor
 from tools import plan as _t_plan
 from tools import dream as _t_dream
 from tools import i as _t_i
+from tools import timeline as _t_timeline
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -218,6 +219,12 @@ decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引�
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 migrate_engine = MigrateEngine(config, bucket_mgr, embedding_engine)              # Migrate engine / 记忆包迁移引擎
 
+# --- Desire engine / 欲望引擎（内核纯函数在 desire_engine.py，接线层在 desire_runtime.py）---
+# 只读状态永远可看；行为覆盖走 OMBRE_DESIRE_DRIVEN 总闸（默认关）。
+# v2.4.0/v2.6.0 由容容与小克共建；2.7.0 升级时接线曾丢失，2026-07-15 焊回。
+from desire_runtime import DesireRuntime
+desire_runtime = DesireRuntime(config, bucket_mgr)
+
 # --- GitHub Sync / GitHub 同步 ---
 from github_sync import GitHubSync  # type: ignore
 _gh_cfg = config.get("github_sync", {}) or {}
@@ -357,6 +364,7 @@ _wsh.init_runtime(
     migrate_engine=migrate_engine,
     github_sync_instance=github_sync_instance,
     restart_github_auto_task=_restart_github_auto_task,
+    desire_runtime=desire_runtime,
 )
 # 启动时把磁盘上的会话装回内存（容器重启不踢登录）。鉴权/会话逻辑全在 web/_shared.py，
 # server.py 自身已无 @mcp.custom_route 路由，只需启动时载入一次会话。
@@ -481,6 +489,21 @@ async def _with_notice(coro: Awaitable[str], op: str = "", args: dict | None = N
     # 正常路径
     if op:
         _log_op_ok(op, result)
+        # --- 欲望引擎：把这次真实调用当事件喂进去（全程吞错，永不影响主流程）---
+        try:
+            desire_runtime.on_tool_event(op, args or {})
+            await desire_runtime.ensure_started()
+        except Exception:
+            pass
+        try:
+            if op == "pulse":
+                # 自检时看一眼我自己此刻想什么（只读，不 gate）
+                result += desire_runtime.state_text()
+            elif op == "breath" and not (args or {}).get("query"):
+                # 浮现模式尾部一行「此刻」——只有 DESIRE_DRIVEN 总闸开了才附
+                result += desire_runtime.breath_suffix()
+        except Exception:
+            pass
     try:
         extras = format_warnings_suffix(pop_warnings())
     except Exception:
@@ -811,6 +834,23 @@ async def I(
     )
 
 
+@mcp_extra.tool()
+async def timeline(
+    text: Optional[str] = "",
+    date: Optional[str] = "",
+    entry_id: Optional[str] = "",
+    remove: Optional[bool] = False,
+) -> str:
+    """我们的线性时间线——按日期排好的大事记，换窗后先看这条线再去桶里找细节。
+    不带参数=读整条时间线（附[id]）；text=记一条（一两句话概括，date 空=今天，也可写 2026-06-19 / 6月19日）；
+    entry_id+text/date=改那条；entry_id+remove=True=删那条。容容也能在 dashboard 里增删改。"""
+    return await _with_notice(
+        _t_timeline.dispatch(text=text, date=date, entry_id=entry_id, remove=remove),
+        op="timeline",
+        args={"text_len": len(text or ""), "date": date, "entry_id": entry_id, "remove": remove},
+    )
+
+
 @mcp.tool()
 async def dream(
     window_hours: Optional[int] = 48,
@@ -917,6 +957,7 @@ if __name__ == "__main__":
             logger=logger,
             decay_engine=decay_engine,
             embedding_outbox=embedding_outbox,
+            desire_runtime=desire_runtime,
             ensure_ollama_child=_ollama_local.ensure_child_on_boot,
             stop_ollama_child=_ollama_local.stop_child,
             load_tunnel_config=_load_tunnel_config,
