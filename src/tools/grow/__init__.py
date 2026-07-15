@@ -19,16 +19,31 @@ grow 是「我把一段长内容整理进记忆」。短内容（<30 字）走 s
 ========================================
 """
 
+from typing import Optional
+
 from .. import _runtime as rt
+from .._common import check_grow_input_size, check_grow_items_payload
 from .shortpath import grow_shortpath
-from .core import grow_core
+from .core import grow_core, grow_items
 
 
-async def dispatch(content: str) -> str:
+async def dispatch(content: str = "", items: Optional[list] = None) -> str:
     await rt.decay_engine.ensure_started()
+
+    # 预拆分模式：上层 AI 已拆好 N 条最终正文 → 逐字入库，跳过 digest 的二次改写。
+    # 传了 items（非空列表）即走此路；不传则行为与旧版完全一致（向后兼容）。
+    if isinstance(items, list) and len(items) > 0:
+        err = check_grow_items_payload(items)
+        if err:
+            return err
+        return await grow_items(items)
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
+
+    err = check_grow_input_size(content)
+    if err:
+        return err
 
     if len(content.strip()) < 30:
         return await grow_shortpath(content)

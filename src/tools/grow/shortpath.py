@@ -56,6 +56,7 @@ async def grow_shortpath(content: str) -> str:
     if not is_merged:
         asyncio.create_task(check_duplicate_for(result_name, content.strip()))
     result = (
+        "短内容已按 hold 路径保存为单条记忆，没有拆分。\n"
         f"{action} → {result_name} | "
         f"{','.join(analysis.get('domain', []))} "
         f"V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"

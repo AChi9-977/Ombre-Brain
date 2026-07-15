@@ -17,14 +17,21 @@ core（普通存入 + 自动合并）。
 - 不返回结构化数据，统一返回供模型阅读的中文短句
 
 对外暴露：dispatch(content, tags, importance, pinned, feel, source_bucket,
-                   valence, arousal, why_remembered) → str
+                   valence, arousal, why_remembered, meaning, media) → str
 ========================================
 """
 
 from typing import Optional
 
+from utils import parse_bool
+
 from .. import _runtime as rt
-from .._common import check_content_size, enforce_high_importance_quota, enforce_pinned_quota
+from .._common import (
+    check_content_size,
+    check_metadata_size,
+    enforce_high_importance_quota,
+    enforce_pinned_quota,
+)
 from .feel import store_feel
 from .pinned import store_pinned
 from .core import store_core
@@ -40,18 +47,68 @@ async def dispatch(
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
+    meaning: Optional[str] = "",
+    media: Optional[list | str] = None,
+    test_data: Optional[bool] = False,
 ) -> str:
-    if tags is None: tags = ""
-    if importance is None: importance = 5
-    if pinned is None: pinned = False
-    if feel is None: feel = False
-    if source_bucket is None: source_bucket = ""
-    if valence is None: valence = -1
-    if arousal is None: arousal = -1
-    if why_remembered is None: why_remembered = ""
+    content = "" if content is None else str(content)
+    if tags is None:
+        tags = ""
+    if importance is None:
+        importance = 5
+    if pinned is None:
+        pinned = False
+    if feel is None:
+        feel = False
+    if source_bucket is None:
+        source_bucket = ""
+    if valence is None:
+        valence = -1
+    if arousal is None:
+        arousal = -1
+    if why_remembered is None:
+        why_remembered = ""
     why_remembered = str(why_remembered).strip()[:500]
+    if meaning is None:
+        meaning = ""
+    meaning = str(meaning).strip()
+    test_data = parse_bool(test_data, default=False)
+    if test_data and (pinned or feel):
+        return "测试数据不能创建为 pinned 或 feel；请使用普通测试桶。"
+    try:
+        importance = int(importance)
+    except (TypeError, ValueError, OverflowError):
+        importance = 5
+    try:
+        valence = float(valence)
+    except (TypeError, ValueError, OverflowError):
+        valence = -1
+    try:
+        arousal = float(arousal)
+    except (TypeError, ValueError, OverflowError):
+        arousal = -1
+
+    metadata_err = check_metadata_size(
+        tags=tags,
+        source_bucket=source_bucket,
+        why_remembered=why_remembered,
+        meaning=meaning,
+    )
+    if metadata_err:
+        return metadata_err
     if rt.mark_op:
         rt.mark_op("hold")
+    rt.record_v3_tool_event("hold", {
+        "content_length": len(content or ""),
+        "tags": tags,
+        "importance": importance,
+        "pinned": pinned,
+        "feel": feel,
+        "source_bucket": source_bucket,
+        "valence": valence,
+        "arousal": arousal,
+        "why_remembered_length": len(why_remembered or ""),
+    })
     await rt.decay_engine.ensure_started()
 
     if not content or not content.strip():
@@ -106,7 +163,7 @@ async def dispatch(
 
     if feel:
         if not source_bucket or not source_bucket.strip():
-            return "feel 必须指向一条原始记忆（source_bucket 不能为空）。请先用 breath(query=...) 找到那条桶的 bucket_id，再传入 source_bucket=id。"
+            return "feel 必须指向一条原始记忆（source_bucket 不能为空）。请先用 breath_search(query=...) 找到那条桶的 bucket_id，再传入 source_bucket=id。"
         result = await store_feel(
             content=content,
             extra_tags=extra_tags,
@@ -114,6 +171,8 @@ async def dispatch(
             arousal=arousal,
             source_bucket=source_bucket,
             why_remembered=why_remembered,
+            meaning=meaning,
+            media=media,
         )
         return result
 
@@ -124,6 +183,8 @@ async def dispatch(
             valence=valence,
             arousal=arousal,
             why_remembered=why_remembered,
+            meaning=meaning,
+            media=media,
         )
         return result
 
@@ -134,5 +195,8 @@ async def dispatch(
         valence=valence,
         arousal=arousal,
         why_remembered=why_remembered,
+        meaning=meaning,
+        media=media,
+        test_data=test_data,
     )
     return result
