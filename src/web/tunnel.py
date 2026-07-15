@@ -28,8 +28,14 @@ from starlette.responses import Response
 
 from . import _shared as sh
 
+try:
+    from utils import parse_bool  # type: ignore
+except ImportError:  # pragma: no cover
+    from ..utils import parse_bool  # type: ignore
+
 _tunnel_proc: Optional[_subprocess.Popen] = None
 _tunnel_last_error: str = ""  # last captured stderr lines from cloudflared
+_tunnel_config_lock = _threading.RLock()
 
 
 def _get_tunnel_config_file() -> str:
@@ -48,8 +54,26 @@ def _load_tunnel_config() -> dict:
 
 
 def _save_tunnel_config(data: dict) -> None:
-    with open(_get_tunnel_config_file(), "w", encoding="utf-8") as f:
-        _json_lib.dump(data, f, ensure_ascii=False)
+    path = _get_tunnel_config_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}.{_threading.get_ident()}"
+    payload = _json_lib.dumps(data, ensure_ascii=False)
+    with _tunnel_config_lock:
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            persisted = _load_tunnel_config()
+            if persisted != data:
+                raise OSError("tunnel config verification failed after write")
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _tunnel_running() -> bool:
@@ -68,7 +92,8 @@ def _start_tunnel(token: str) -> tuple[bool, str]:
         return True, "already running"
     cf = shutil.which("cloudflared")
     if not cf:
-        return False, "cloudflared 未安装，请在 Dockerfile 中添加或手动安装"
+        return False, ("cloudflared 未安装（镜像可能以 --build-arg INSTALL_CLOUDFLARED=0 构建）。"
+                       "重新构建时去掉该参数，或手动安装 cloudflared 后再用隧道管理。")
     try:
         _tunnel_last_error = ""
         _tunnel_proc = _subprocess.Popen(
@@ -122,6 +147,14 @@ def register(mcp) -> None:
             "running": running,
             "token_set": bool(cfg.get("token")),
             "auto_start": cfg.get("auto_start", False),
+            "mcp_auth_required": parse_bool(
+                sh.config.get("mcp_require_auth", True), default=True
+            ),
+            "mcp_auth_mode": (
+                str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower()
+                if str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower() in ("oauth", "token")
+                else "oauth"
+            ),
             "last_error": _tunnel_last_error if not running else "",
         })
 
@@ -135,14 +168,36 @@ def register(mcp) -> None:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
-        token = body.get("token", "").strip()
-        auto_start = bool(body.get("auto_start", False))
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+
         cfg = _load_tunnel_config()
-        if token:
-            cfg["token"] = token
-        cfg["auto_start"] = auto_start
-        _save_tunnel_config(cfg)
-        return JSONResponse({"ok": True})
+        if "token" in body:
+            token = body["token"]
+            if not isinstance(token, str):
+                return JSONResponse({"error": "token must be a string"}, status_code=400)
+            token = token.strip()
+            if token:
+                cfg["token"] = token
+        if "auto_start" in body:
+            try:
+                cfg["auto_start"] = parse_bool(body["auto_start"])
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
+
+        try:
+            _save_tunnel_config(cfg)
+            persisted = _load_tunnel_config()
+        except Exception as exc:
+            return JSONResponse({
+                "error": f"tunnel config save failed: {exc}",
+            }, status_code=500)
+        return JSONResponse({
+            "ok": True,
+            "token_set": bool(persisted.get("token")),
+            "auto_start": persisted.get("auto_start", False),
+            "persisted": True,
+        })
 
     @mcp.custom_route("/api/tunnel/start", methods=["POST"])
     async def api_tunnel_start(request: Request) -> Response:

@@ -38,7 +38,13 @@ def register(mcp) -> None:
             # without manual hard-refresh after upgrade. 只动字面量 /static/*.svg URL。
             for asset in ("/static/icon.svg", "/static/favicon.svg"):
                 html = html.replace(asset, f"{asset}?v={sh.version}")
-            return HTMLResponse(html)
+            # 别让浏览器缓存仪表板 HTML：否则改了 dashboard.html 重新下发后，
+            # 用户看到的还是旧版面（U-09 只 cache-bust 了 SVG，HTML 本身没设）。
+            # HTML 很小、又是每次从磁盘读，禁缓存代价可忽略，省掉「为什么改了没生效」。
+            return HTMLResponse(
+                html,
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+            )
         except FileNotFoundError:
             # 走到这里 = 部署目录里缺 frontend/dashboard.html。它本应随仓库一起下发
             # （已纳入 git，未被 .gitignore 排除），最常见原因是克隆/部署了旧版本。

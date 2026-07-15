@@ -14,6 +14,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from . import _shared as sh
+from tools._common import check_content_size
 
 logger = sh.logger
 
@@ -117,9 +118,11 @@ def register(mcp) -> None:
             bucket_id = request.path_params.get("bucket_id", "").strip()
             if not bucket_id:
                 return JSONResponse({"error": "missing bucket_id"}, status_code=400)
-            # await request.json() 会把 body 当作 JSON 解析，类型改错会报 ValueError
-            body = await request.json()
-            action = (body.get("action") or "").strip().lower()
+            body = await sh._read_json_object(request)
+            action_raw = body.get("action") or ""
+            if not isinstance(action_raw, str):
+                return JSONResponse({"error": "action must be a string"}, status_code=400)
+            action = action_raw.strip().lower()
             bucket = await sh.bucket_mgr.get(bucket_id)
             if not bucket:
                 return JSONResponse({"error": f"plan not found: {bucket_id}"}, status_code=404)
@@ -149,7 +152,7 @@ def register(mcp) -> None:
                 # 双重检查：类型必须是字符串，且 strip 后非空
                 if not isinstance(new_content, str) or not new_content.strip():
                     return JSONResponse({"error": "content required for edit"}, status_code=400)
-                size_err = _check_content_size(new_content)
+                size_err = check_content_size(new_content)
                 if size_err:
                     return JSONResponse({"error": size_err}, status_code=400)
                 updates["content"] = new_content.strip()
@@ -164,15 +167,8 @@ def register(mcp) -> None:
             ok = await sh.bucket_mgr.update(bucket_id, **updates)
             if not ok:
                 return JSONResponse({"error": "update failed"}, status_code=500)
-            # 改了正文 → embedding 也要重新生成（否则检索会拿老向量不准）
-            # 这里故意吞异常：embedding 完全可能因为网络/配额失败，不能堆出去让前端以为保存干脆了
-            if "content" in updates and isinstance(updates["content"], str):
-                try:
-                    await sh.embedding_engine.generate_and_store(bucket_id, updates["content"])
-                except Exception:
-                    pass
             # --- plan 看板把 plan 显式标 resolved → 联动 related_bucket / resolved_by ---
-            # rule.md §1：与 trace_core 同一逻辑（人工/Claude 显式路径）。
+            # rule.md §1：与 trace_core 同一逻辑（人工/AI 显式路径）。
             cascaded: list[str] = []
             if updates.get("status") == "resolved":
                 from tools._common import cascade_plan_resolved_to_buckets
@@ -188,5 +184,7 @@ def register(mcp) -> None:
                 "updates": {k: v for k, v in updates.items() if k != "change_log"},
                 "cascaded_resolved": cascaded,
             })
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
