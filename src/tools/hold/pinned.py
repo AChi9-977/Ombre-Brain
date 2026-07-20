@@ -33,6 +33,7 @@ async def store_pinned(
     valence: float,
     arousal: float,
     why_remembered: str,
+    trigger_date: str = "",
 ) -> str:
     try:
         analysis = await rt.dehydrator.analyze(content)
@@ -69,6 +70,7 @@ async def store_pinned(
         bucket_type="permanent",
         pinned=True,
         why_remembered=why_remembered,
+        trigger_date=trigger_date,
     )
     # iter 2.1+ 起 create() 内部已调用 _sync_embedding，permanent 桶与普通桶一样
     # 在落盘后立刻向量化，此处无需重复生成（否则每次钉选都多打一次 embedding API）。

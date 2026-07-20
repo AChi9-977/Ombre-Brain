@@ -24,10 +24,10 @@ import asyncio
 import uuid
 
 from .. import _runtime as rt
-from .._common import merge_or_create, check_duplicate_for, check_plan_resolution
+from .._common import merge_or_create, post_write_relations, check_plan_resolution
 
 
-async def grow_shortpath(content: str) -> str:
+async def grow_shortpath(content: str, trigger_date: str = "") -> str:
     rt.logger.info(f"grow short-content fast path: {len(content.strip())} chars")
     try:
         analysis = await rt.dehydrator.analyze(content)
@@ -50,11 +50,12 @@ async def grow_shortpath(content: str) -> str:
         raw_merge=True,
         source_tool="grow",
         grow_batch_id=batch_id,
+        trigger_date=trigger_date,
     )
     action = "合并" if is_merged else "新建"
     asyncio.create_task(check_plan_resolution(content, source_bucket_id=result_name))
     if not is_merged:
-        asyncio.create_task(check_duplicate_for(result_name, content.strip()))
+        asyncio.create_task(post_write_relations(result_name, content.strip()))
     result = (
         f"{action} → {result_name} | "
         f"{','.join(analysis.get('domain', []))} "

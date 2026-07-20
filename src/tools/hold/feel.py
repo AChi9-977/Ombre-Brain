@@ -48,6 +48,7 @@ async def store_feel(
     arousal: float,
     source_bucket: str,
     why_remembered: str,
+    trigger_date: str = "",
 ) -> str:
     feel_valence = valence if 0 <= valence <= 1 else 0.5
     feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
@@ -65,6 +66,7 @@ async def store_feel(
         triggered_by=source_bucket.strip() if source_bucket else "",
         source_tool="hold",
         bucket_id_override=_build_feel_id(feel_valence),
+        trigger_date=trigger_date,
     )
     try:
         await rt.embedding_engine.generate_and_store(bucket_id, content)

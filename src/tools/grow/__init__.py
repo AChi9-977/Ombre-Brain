@@ -24,12 +24,12 @@ from .shortpath import grow_shortpath
 from .core import grow_core
 
 
-async def dispatch(content: str) -> str:
+async def dispatch(content: str, trigger_date: str = "") -> str:
     await rt.decay_engine.ensure_started()
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
 
     if len(content.strip()) < 30:
-        return await grow_shortpath(content)
-    return await grow_core(content)
+        return await grow_shortpath(content, trigger_date=trigger_date)
+    return await grow_core(content, trigger_date=trigger_date)

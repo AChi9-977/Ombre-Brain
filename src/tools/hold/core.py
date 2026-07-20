@@ -27,7 +27,7 @@ tools/hold/core.py — hold 普通存入分支（含自动合并）
 import asyncio
 
 from .. import _runtime as rt
-from .._common import merge_or_create, check_duplicate_for, check_plan_resolution
+from .._common import merge_or_create, post_write_relations, check_plan_resolution
 
 
 async def store_core(
@@ -37,6 +37,7 @@ async def store_core(
     valence: float,
     arousal: float,
     why_remembered: str,
+    trigger_date: str = "",
 ) -> str:
     try:
         analysis = await rt.dehydrator.analyze(content)
@@ -67,12 +68,13 @@ async def store_core(
         raw_merge=True,
         why_remembered=why_remembered,
         source_tool="hold",
+        trigger_date=trigger_date,
     )
 
     action = "合并→" if is_merged else "新建→"
     asyncio.create_task(check_plan_resolution(content, source_bucket_id=result_name))
     if not is_merged:
-        asyncio.create_task(check_duplicate_for(result_name, content))
+        asyncio.create_task(post_write_relations(result_name, content))
     result = f"{action}{result_name} {','.join(str(d) for d in domain if d is not None)}"
     if embed_warn:
         result += f"\n⚠️ {embed_warn}"

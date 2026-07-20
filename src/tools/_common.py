@@ -58,9 +58,10 @@ _HIGH_IMP_DEGRADE_TO = 8               # 超限时自动降到的 importance
 # --- pinned 软阈值 ---
 _PINNED_SOFT_GAP = 2                   # “软阈值 = cap - GAP”；cap=20 → soft=18
 
-# --- check_duplicate_for / check_plan_resolution ---
+# --- post_write_relations (E3: dup + related 两层判断) ---
 _DUP_DEFAULT_THRESHOLD = 0.95          # 向量相似 >= 该值 → 标为疑似重复
-_DUP_TOPK = 10                         # 检索前 N 个候选以判重复
+_RELATED_THRESHOLD = 0.65              # 向量相似 >= 该值且 < DUP 阈值 → 建立双向关联
+_RELATED_TOPK = 20                     # 检索前 N 个候选以判重复和关联
 _PLAN_VECTOR_TOPK = 20                 # plan 判定的向量预筛范围
 _PLAN_VECTOR_THRESHOLD = 0.7           # 超过才交给 LLM 判定是否已完成
 _PLAN_LLM_CONFIDENCE_MIN = 0.7         # LLM judgement.confidence 下限
@@ -353,6 +354,7 @@ async def merge_or_create(
     why_remembered: str = "",
     source_tool: str = "",
     grow_batch_id: str = "",
+    trigger_date: str = "",
 ) -> Tuple[str, bool, str]:
     """
     检查是否有相似桶可合并，有则合并，无则新建。返回 (桶ID或名称, 是否合并, embed警告信息)。
@@ -374,7 +376,7 @@ async def merge_or_create(
             content=content, tags=tags, importance=importance, domain=domain,
             valence=valence, arousal=arousal, name=name, raw_merge=raw_merge,
             why_remembered=why_remembered, source_tool=source_tool,
-            grow_batch_id=grow_batch_id,
+            grow_batch_id=grow_batch_id, trigger_date=trigger_date,
         )
 
 
@@ -390,6 +392,7 @@ async def _merge_or_create_inner(
     why_remembered: str = "",
     source_tool: str = "",
     grow_batch_id: str = "",
+    trigger_date: str = "",
 ) -> Tuple[str, bool, str]:
     """实际的 search→merge/create 逻辑，由 merge_or_create 在 Lock 保护下调用。"""
     try:
@@ -461,6 +464,7 @@ async def _merge_or_create_inner(
         why_remembered=why_remembered,
         source_tool=source_tool,
         grow_batch_id=grow_batch_id,
+        trigger_date=trigger_date,
     )
     # iter 2.1+ 起 create() 内部已调用 _sync_embedding，此处无需重复生成。
     # 只需从 embedding_engine 探测上次是否成功（检查 db 中是否有该 id）。
@@ -489,36 +493,88 @@ async def _merge_or_create_inner(
     return bucket_id, False, embed_warn
 
 
-async def check_duplicate_for(new_bucket_id: str, new_text: str, threshold: float = _DUP_DEFAULT_THRESHOLD) -> None:
-    """fire-and-forget：新桶写完后，向量相似 > threshold 的旧桶标为疑似重复。
+async def post_write_relations(new_bucket_id: str, new_text: str) -> None:
+    """fire-and-forget：新桶写完后，一次语义搜索做两层判断。
 
-    iter 1.6 §4：不自动合并，只在两边各写 dup_candidate=<对端 id> + dup_score=<0~1>，
-    Dashboard 在桶详情里显示「疑似重复」提示，由她/他手动确认是否合并。
+    E3 整合：复用同一批 embedding 搜索结果，按相似度分层处理：
+    - score >= 0.95 → 标记 dup_candidate（疑似重复，Dashboard 手动确认合并）
+    - 0.65 <= score < 0.95 → 建立双向 related 链接（检索上下文增强）
+    - score < 0.65 → 不操作
+
+    封存桶不参与关联。related 字段是去重的 bucket_id 列表。
     """
     try:
         if not rt.embedding_engine or not getattr(rt.embedding_engine, "enabled", False):
             return
-        sims = await rt.embedding_engine.search_similar(new_text, top_k=_DUP_TOPK)
+        sims = await rt.embedding_engine.search_similar(new_text, top_k=_RELATED_TOPK)
+        dup_marked = False
+        related_count = 0
         for bid, score in sims:
             if bid == new_bucket_id:
                 continue
-            if score < threshold:
+            if score < _RELATED_THRESHOLD:
                 continue
+
+            # 检查对端桶是否存在且非封存
             try:
-                await rt.bucket_mgr.update(
-                    new_bucket_id, dup_candidate=bid, dup_score=round(float(score), 4)
-                )
-                await rt.bucket_mgr.update(
-                    bid, dup_candidate=new_bucket_id, dup_score=round(float(score), 4)
-                )
-                rt.logger.info(
-                    f"duplicate candidate: {new_bucket_id} ↔ {bid} (sim={score:.3f})"
-                )
-            except Exception as e:
-                rt.logger.warning(f"dup mark failed: {e}")
-            break  # 只标最相似的一对
+                other = await rt.bucket_mgr.get(bid)
+            except Exception:
+                continue
+            if not other:
+                continue
+            # 封存桶不参与关联
+            if other["metadata"].get("type") == "archived":
+                continue
+
+            if score >= _DUP_DEFAULT_THRESHOLD and not dup_marked:
+                # 最高相似的一对标为疑似重复
+                try:
+                    await rt.bucket_mgr.update(
+                        new_bucket_id, dup_candidate=bid, dup_score=round(float(score), 4)
+                    )
+                    await rt.bucket_mgr.update(
+                        bid, dup_candidate=new_bucket_id, dup_score=round(float(score), 4)
+                    )
+                    rt.logger.info(
+                        f"duplicate candidate: {new_bucket_id} ↔ {bid} (sim={score:.3f})"
+                    )
+                    dup_marked = True
+                except Exception as e:
+                    rt.logger.warning(f"dup mark failed: {e}")
+
+            elif _RELATED_THRESHOLD <= score < _DUP_DEFAULT_THRESHOLD:
+                # 建立双向 related 链接（去重追加）
+                try:
+                    # 读取双方现有的 related 列表
+                    new_b = await rt.bucket_mgr.get(new_bucket_id)
+                    new_related = list(new_b["metadata"].get("related") or []) if new_b else []
+                    other_related = list(other["metadata"].get("related") or [])
+
+                    if bid not in new_related:
+                        new_related.append(bid)
+                        await rt.bucket_mgr.update(new_bucket_id, related=new_related)
+                    if new_bucket_id not in other_related:
+                        other_related.append(new_bucket_id)
+                        await rt.bucket_mgr.update(bid, related=other_related)
+
+                    related_count += 1
+                    rt.logger.info(
+                        f"related link: {new_bucket_id} ↔ {bid} (sim={score:.3f})"
+                    )
+                except Exception as e:
+                    rt.logger.warning(f"related link failed: {e}")
+
+        if related_count > 0:
+            rt.logger.info(
+                f"post_write_relations: {new_bucket_id} linked to {related_count} buckets"
+            )
     except Exception as e:
-        rt.logger.warning(f"check_duplicate_for outer error: {e}")
+        rt.logger.warning(f"post_write_relations outer error: {e}")
+
+
+# 向后兼容别名
+check_duplicate_for = post_write_relations
+_post_write_relations = post_write_relations
 
 
 async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "") -> None:

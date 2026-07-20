@@ -40,6 +40,7 @@ async def dispatch(
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
+    trigger_date: Optional[str] = "",
 ) -> str:
     if tags is None: tags = ""
     if importance is None: importance = 5
@@ -49,6 +50,7 @@ async def dispatch(
     if valence is None: valence = -1
     if arousal is None: arousal = -1
     if why_remembered is None: why_remembered = ""
+    if trigger_date is None: trigger_date = ""
     why_remembered = str(why_remembered).strip()[:500]
     if rt.mark_op:
         rt.mark_op("hold")
@@ -105,8 +107,8 @@ async def dispatch(
     # 这里返回值只承载业务正文。
 
     if feel:
-        if not source_bucket or not source_bucket.strip():
-            return "feel 必须指向一条原始记忆（source_bucket 不能为空）。请先用 breath(query=...) 找到那条桶的 bucket_id，再传入 source_bucket=id。"
+        # source_bucket 是可选参数：传了→建立因果链并标记源桶为 digested；
+        # 不传→作为独立感受写入，不关联任何源记忆。
         result = await store_feel(
             content=content,
             extra_tags=extra_tags,
@@ -114,6 +116,7 @@ async def dispatch(
             arousal=arousal,
             source_bucket=source_bucket,
             why_remembered=why_remembered,
+            trigger_date=trigger_date,
         )
         return result
 
@@ -124,6 +127,7 @@ async def dispatch(
             valence=valence,
             arousal=arousal,
             why_remembered=why_remembered,
+            trigger_date=trigger_date,
         )
         return result
 
@@ -134,5 +138,6 @@ async def dispatch(
         valence=valence,
         arousal=arousal,
         why_remembered=why_remembered,
+        trigger_date=trigger_date,
     )
     return result

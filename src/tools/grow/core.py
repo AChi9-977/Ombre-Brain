@@ -31,12 +31,12 @@ from .. import _runtime as rt
 from .._common import (
     merge_or_create,
     check_content_size,
-    check_duplicate_for,
+    post_write_relations,
     check_plan_resolution,
 )
 
 
-async def grow_core(content: str) -> str:
+async def grow_core(content: str, trigger_date: str = "") -> str:
     try:
         items = await rt.dehydrator.digest(content)
     except Exception as e:
@@ -74,6 +74,7 @@ async def grow_core(content: str) -> str:
                 name=item.get("name", ""),
                 source_tool="grow",
                 grow_batch_id=batch_id,
+                trigger_date=trigger_date,
             )
             if embed_warn and embed_warn not in embed_warnings:
                 embed_warnings.append(embed_warn)
@@ -84,7 +85,7 @@ async def grow_core(content: str) -> str:
             else:
                 results.append(f"📝{item.get('name', result_name)}")
                 created += 1
-                asyncio.create_task(check_duplicate_for(result_name, item["content"]))
+                asyncio.create_task(post_write_relations(result_name, item["content"]))
         except Exception as e:
             rt.logger.warning(
                 f"Failed to process diary item / 日记条目处理失败: "

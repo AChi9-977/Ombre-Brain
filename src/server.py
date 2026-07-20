@@ -8,8 +8,9 @@ DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime �
 web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/tools/<工具>/ 下面）。
 
 关键行为：
-- 启动后暴露 12 个 MCP 工具：breath/hold/grow/trace/anchor/release/
-  pulse/plan/letter_write/letter_read/dream/I；每个入口 ≤ 10 行，只负责转发
+- 启动后暴露 16 个 MCP 工具：breath/hold/grow/trace/dream（主）+ wakeup/anchor/
+  release/pulse/plan/letter_write/letter_read/I/todos/timeline/archive_session（副）；
+  每个入口 ≤ 10 行，只负责转发
 - Dashboard / HTTP 路由全部已拆分到 src/web/<域>.py（每个模块 register(mcp)），
   本文件仅在启动时调用 web.register_all(mcp) 装配；共享依赖见 web/_shared.py
 - 仍保留在本文件：进程启动、引擎初始化、GitHub 后台同步循环、Webhook 推送、
@@ -71,6 +72,7 @@ from tools import i as _t_i
 from tools import todos as _t_todos
 from tools import timeline as _t_timeline
 from tools import archive_session as _t_archive_session
+from tools import wakeup as _t_wakeup
 from tools._common import (
     check_content_size as _check_content_size,
     check_pinned_quota as _check_pinned_quota,
@@ -619,31 +621,33 @@ async def hold(
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
+    trigger_date: Optional[str] = "",
 ) -> str:
-    """我把一件事/一个感受存进我的记忆。系统会自动打标并尝试合并近似的旧桶。tags逗号分隔,importance 1-10。pinned=True=钉为永久核心准则,不衰减不合并。feel=True=记下我的第一人称感受(不参与普通浮现,只通过 breath(domain=\"feel\") 读)。source_bucket=我正在消化的那个原始记忆桶ID,会被标为已消化加速淡化。why_remembered=为什么记得这一条（可选，自由文本，仅用于展示不计分）。"""
+    """我把一件事/一个感受存进我的记忆。系统会自动打标并尝试合并近似的旧桶。tags逗号分隔,importance 1-10。pinned=True=钉为永久核心准则,不衰减不合并。feel=True=记下我的第一人称感受(不参与普通浮现,只通过 breath(domain=\"feel\") 读)。source_bucket=我正在消化的那个原始记忆桶ID,会被标为已消化加速淡化。why_remembered=为什么记得这一条（可选，自由文本，仅用于展示不计分）。trigger_date=可选YYYY-MM-DD,设为未来的日期则到那天开机时我会在「今日浮现」区看到它。"""
     return await _with_notice(
         _t_hold.dispatch(
             content=content, tags=tags, importance=importance,
             pinned=pinned, feel=feel, source_bucket=source_bucket,
             valence=valence, arousal=arousal, why_remembered=why_remembered,
+            trigger_date=trigger_date,
         ),
         op="hold",
         args={
             "content_len": len(content or ""), "tags": tags,
             "importance": importance, "pinned": pinned, "feel": feel,
             "source_bucket": source_bucket, "valence": valence, "arousal": arousal,
-            "why_len": len(why_remembered or ""),
+            "why_len": len(why_remembered or ""), "trigger_date": trigger_date,
         },
     )
 
 
 @mcp.tool()
-async def grow(content: str) -> str:
-    """我把一段长内容（一天的事/一段日记/一篇她他给我的总结）整理进记忆,系统会拆成 2~6 条独立的事件桶并各自尝试合并。短内容(<30字)走 hold 单条快速路径,不强行拆。"""
+async def grow(content: str, trigger_date: Optional[str] = "") -> str:
+    """我把一段长内容（一天的事/一段日记/一篇她他给我的总结）整理进记忆,系统会拆成 2~6 条独立的事件桶并各自尝试合并。短内容(<30字)走 hold 单条快速路径,不强行拆。trigger_date=可选YYYY-MM-DD,设为未来日期则到那天开机时在「今日浮现」区看到。"""
     return await _with_notice(
-        _t_grow.dispatch(content),
+        _t_grow.dispatch(content, trigger_date=trigger_date or ""),
         op="grow",
-        args={"content_len": len(content or "")},
+        args={"content_len": len(content or ""), "trigger_date": trigger_date},
     )
 
 
@@ -835,15 +839,27 @@ async def archive_session(
     mood: Optional[str] = "",
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
+    message: Optional[str] = "",
 ) -> str:
-    """将本次对话摘要存入记忆归档。summary=必填，对话摘要正文；highlights=可选，本次亮点；mood=可选，情绪描述；valence/arousal=可选，0~1情感坐标。"""
+    """将本次对话摘要存入记忆归档。summary=必填，对话摘要正文；highlights=可选，本次亮点；mood=可选，情绪描述；valence/arousal=可选，0~1情感坐标；message=可选，写给下一个对话窗口的留言（存入信箱，下次开机时我会看到）。"""
     return await _with_notice(
         _t_archive_session.dispatch(
             summary=summary, highlights=highlights, mood=mood,
-            valence=valence, arousal=arousal,
+            valence=valence, arousal=arousal, message=message,
         ),
         op="archive_session",
-        args={"summary_len": len(summary or ""), "highlights": highlights, "mood": mood},
+        args={"summary_len": len(summary or ""), "highlights": highlights, "mood": mood,
+              "message_len": len(message or "")},
+    )
+
+
+@mcp_extra.tool()
+async def wakeup() -> str:
+    """☀️ 一键开机——单次调用返回记忆系统全景：钉选桶摘要、最近对话归档、未完结待办、最新信箱留言、随机较早感受回声、今日触发浮现。每区附带验真字段。每次新对话开始时先调这个，再做其他操作。"""
+    return await _with_notice(
+        _t_wakeup.dispatch(),
+        op="wakeup",
+        args={},
     )
 
 

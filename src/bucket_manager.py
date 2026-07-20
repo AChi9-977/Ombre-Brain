@@ -294,6 +294,7 @@ class BucketManager:
         source_tool: str = "",
         grow_batch_id: str = "",
         bucket_id_override: str = "",
+        trigger_date: str = "",
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -394,6 +395,12 @@ class BucketManager:
         # triggered_by = 触发这条 feel 的源 bucket_id。1.9 会做 UI 联动。
         if triggered_by:
             metadata["triggered_by"] = str(triggered_by).strip()[:_TRIGGERED_BY_MAX]
+        # --- D: 触发日期字段 ---
+        # 可选 YYYY-MM-DD 格式日期，到期时开机工具会在「今日浮现」区列出。
+        # trigger_processed 默认 False，由 trace 标记已处理后不再浮现。
+        if trigger_date:
+            metadata["trigger_date"] = str(trigger_date).strip()[:10]
+            metadata["trigger_processed"] = False
         # --- iter 1.8: plan 的「承诺重量」0.0-1.0，与 importance 不同 ---
         # importance = 这件事多重要；weight = 这件事压在我心头多重。
         if bucket_type == "plan" and weight is not None:
@@ -608,7 +615,11 @@ class BucketManager:
                   # release 时自动恢复；None 表示删除该字段。
                   "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool",
                   # E5: dormant 标记——30天未访问且 importance<3 的桶进入休眠状态
-                  "dormant"):
+                  "dormant",
+                  # D: 触发日期字段
+                  "trigger_date", "trigger_processed",
+                  # E3: 双向关联桶 ID 列表
+                  "related"):
             if k in kwargs:
                 if k == "weight" and kwargs[k] is not None:
                     post[k] = _clamp01(kwargs[k], _DEFAULT_VALENCE)
