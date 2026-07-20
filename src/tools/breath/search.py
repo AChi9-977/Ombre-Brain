@@ -3,14 +3,17 @@
 tools/breath/search.py — 有 query 的检索模式
 ========================================
 
-走 breath(query=...) 时进入这里。两路并行：bucket_manager 关键词检索 +
-embedding_engine 向量近邻，结果合并去重，逐条 dehydrate 后塞 token 预算。
+走 breath(query=...) 时进入这里。一次向量查询与 bucket_manager 的
+关键词/BM25 检索融合，命中后逐字返回桶正文并套 token 预算。
 
 关键行为：
 - domain/valence/arousal 作为过滤参数传给 bucket_mgr.search
-- 向量通道阈值 sim>0.5；archived 桶不能从向量通道漂回（违反契约）
-- 命中后调 touch()，记忆重构会把展示层 valence 按当前情绪做 ±0.1 微调
-- 检索结果 < 3 时 40% 概率从低权重旧桶里随机漂出 1-3 条「忽然想起来」
+- embedding 未配置/未启用/调用失败时明确提示并继续关键词/BM25 检索
+- 向量通道阈值 sim>=0.65；domain/tags/type 过滤与关键词通道完全一致
+- 命中正文不经过 LLM 摘要、改写或压缩，直接返回当前存储的 content
+- 命中后调 touch()，但不修改本次返回的正文或元数据
+- 显式检索保持确定性，不混入随机漂浮；普通桶限额之外的核心命中仍返回
+- date_from/date_to 按稳定 updated_at（老桶回退 created）过滤
 - 命中 0 条时回 webhook 报空，并给出可操作的引导文案
 
 不做什么（边界）：
@@ -19,14 +22,26 @@ embedding_engine 向量近邻，结果合并去重，逐条 dehydrate 后塞 tok
 - dont_surface=True 在检索中保留——主动遗忘只限制无参浮现
 
 对外暴露：surface_search(query, max_results, max_tokens, domain, valence,
-                          arousal, tag_filter) → str
+                          arousal, tag_filter, date_from, date_to) → str
 ========================================
 """
 
-import random
+import asyncio
+from datetime import date
+import random  # compatibility for older tests/extensions; explicit search no longer uses drift
 
+from ombrebrain.policy.surfacing import SurfacePolicyVM
 from .. import _runtime as rt
-from utils import strip_wikilinks, count_tokens_approx
+from ._verbatim import render_stored_bucket
+
+_SURFACE_POLICY = SurfacePolicyVM.default()
+
+_VECTOR_QUERY_TOPK = 50
+_ALL_SEARCH_RESULTS = -1
+_MAX_CORE_RESULTS = 20
+
+_SEMANTIC_DISABLED_NOTE = "[检索降级：语义索引暂不可用，本次仅使用关键词/BM25。]"
+_BUDGET_NOTICE = "[token 预算不足：命中的下一条记忆未被截断或摘要，请提高 max_tokens 后重试。]"
 
 
 def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
@@ -36,30 +51,52 @@ def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
     return all(t in bucket_tags for t in tag_filter)
 
 
-def _in_date_range(meta: dict, date_from: str, date_to: str) -> bool:
-    if not date_from and not date_to:
-        return True
-    ts = str(meta.get("last_active") or meta.get("created", ""))[:10]
-    if not ts:
-        return True
-    if date_from and ts < date_from:
-        return False
-    if date_to and ts > date_to:
-        return False
-    return True
+def _can_surface_search(bucket: dict) -> bool:
+    return _SURFACE_POLICY.evaluate_bucket(bucket, mode="search").allowed
 
 
-def _bucket_summary_line(b: dict, prefix: str = "") -> str:
-    meta = b["metadata"]
-    name = meta.get("name") or b["id"]
-    domains = ",".join(meta.get("domain", []) or []) or "未分类"
-    val = float(meta.get("valence") or 0.5)
-    aro = float(meta.get("arousal") or 0.3)
-    imp = meta.get("importance", "?")
-    updated = str(meta.get("last_active") or meta.get("created", ""))[:10]
-    related = meta.get("related") or []
-    rel_str = f" 关联:[{','.join(related)}]" if related else ""
-    return f"{prefix}[{b['id']}] 《{name}》 主题:{domains} 情感:V{val:.1f}/A{aro:.1f} 重要:{imp} 更新:{updated}{rel_str}"
+def _parse_date(value: str, field_name: str) -> tuple[date | None, str]:
+    value = str(value or "").strip()
+    if not value:
+        return None, ""
+    try:
+        return date.fromisoformat(value), ""
+    except ValueError:
+        return None, f"{field_name} 必须使用 YYYY-MM-DD 格式。"
+
+
+def _in_updated_range(bucket: dict, start: date | None, end: date | None) -> bool:
+    if start is None and end is None:
+        return True
+    meta = bucket.get("metadata", {}) or {}
+    raw = str(meta.get("updated_at") or meta.get("created") or "")[:10]
+    try:
+        value = date.fromisoformat(raw)
+    except ValueError:
+        return False
+    return (start is None or value >= start) and (end is None or value <= end)
+
+
+async def _semantic_scores(query: str, top_k: int) -> tuple[dict[str, float], str]:
+    """Run the vector query once and return scores plus an optional notice."""
+    engine = rt.embedding_engine
+    if not engine or not getattr(engine, "enabled", False):
+        rt.logger.warning("breath semantic search unavailable; using keyword/BM25 only")
+        return {}, _SEMANTIC_DISABLED_NOTE
+
+    try:
+        strict_search = getattr(engine, "search_similar_strict", None)
+        if callable(strict_search):
+            pairs = await strict_search(query, top_k=top_k)
+        else:
+            pairs = await engine.search_similar(query, top_k=top_k)
+        return {bucket_id: float(score) for bucket_id, score in pairs}, ""
+    except Exception as exc:
+        rt.logger.warning(
+            f"breath semantic search failed; using keyword/BM25 only: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return {}, _SEMANTIC_DISABLED_NOTE
 
 
 async def surface_search(
@@ -70,140 +107,146 @@ async def surface_search(
     valence: float,
     arousal: float,
     tag_filter: list,
-    mode: str = "full",
     date_from: str = "",
     date_to: str = "",
-    include_dormant: bool = False,
 ) -> str:
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
+    start_date, date_error = _parse_date(date_from, "date_from")
+    if date_error:
+        return date_error
+    end_date, date_error = _parse_date(date_to, "date_to")
+    if date_error:
+        return date_error
+    if start_date and end_date and start_date > end_date:
+        return "date_from 不能晚于 date_to。"
+
+    # A full bucket id is an address, not a semantic query.  Resolve it before
+    # embedding/BM25 work so callers can reliably read the on-disk source text
+    # immediately before trace(content=...) without an LLM or derived index in
+    # the path.  Archived/deleted and dedicated bucket types keep the same
+    # visibility boundary as ordinary search.
+    exact_id = query.strip()
+    try:
+        exact_bucket = await rt.bucket_mgr.get(exact_id)
+    except Exception as exc:
+        rt.logger.warning(
+            f"breath exact bucket lookup failed; continuing with search: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        exact_bucket = None
+    if exact_bucket:
+        meta = exact_bucket.get("metadata", {}) or {}
+        is_archived = meta.get("type") == "archived" or bool(meta.get("deleted_at"))
+        if (
+            not is_archived
+            and meta.get("type") not in ("feel", "plan", "letter")
+            and _can_surface_search(exact_bucket)
+            and _bucket_has_tags(meta, tag_filter)
+            and _in_updated_range(exact_bucket, start_date, end_date)
+        ):
+            rendered, entry_tokens = render_stored_bucket(
+                exact_bucket,
+                f"[exact_bucket_id:true] [bucket_id:{exact_bucket['id']}]",
+            )
+            if entry_tokens > max_tokens:
+                return _BUDGET_NOTICE
+            asyncio.create_task(
+                rt.bucket_mgr.touch_many([exact_bucket["id"]], ripple=False)
+            )
+            if rt.fire_webhook:
+                await rt.fire_webhook(
+                    "breath",
+                    {"mode": "exact_id", "matches": 1, "chars": len(rendered)},
+                )
+            return rendered
+
+    vector_scores, semantic_notice = await _semantic_scores(
+        query, top_k=max(max_results, _VECTOR_QUERY_TOPK)
+    )
 
     try:
         matches = await rt.bucket_mgr.search(
             query,
-            limit=max(max_results, 20),
+            # Negative limit is the internal "return all scored hits" sentinel;
+            # the response cap is applied below so the omitted count is exact.
+            limit=_ALL_SEARCH_RESULTS,
             domain_filter=domain_filter,
             query_valence=q_valence,
             query_arousal=q_arousal,
+            vector_scores=vector_scores,
         )
     except Exception as e:
         rt.logger.error(f"Search failed / 检索失败: {e}")
         return "检索过程出错，请稍后重试。"
 
-    matches = [b for b in matches if b["metadata"].get("type") not in ("feel", "plan", "letter")]
+    matches = [
+        b for b in matches
+        if _can_surface_search(b)
+        and b["metadata"].get("type") not in ("feel", "plan", "letter")
+    ]
     matches = [b for b in matches if _bucket_has_tags(b["metadata"], tag_filter)]
-    matches = [b for b in matches if _in_date_range(b["metadata"], date_from, date_to)]
-    matches = [b for b in matches if include_dormant or not b["metadata"].get("dormant", False)]
+    matches = [b for b in matches if _in_updated_range(b, start_date, end_date)]
 
-    # --- 向量通道 ---
-    matched_ids = {b["id"] for b in matches}
-    try:
-        vector_results = await rt.embedding_engine.search_similar(query, top_k=max(max_results, 20))
-        for bucket_id, sim_score in vector_results:
-            if bucket_id not in matched_ids and sim_score > 0.65:
-                bucket = await rt.bucket_mgr.get(bucket_id)
-                if (
-                    bucket
-                    and bucket["metadata"].get("type") not in ("feel", "plan", "letter", "archived")
-                    and _bucket_has_tags(bucket["metadata"], tag_filter)
-                ):
-                    bucket["score"] = round(sim_score * 100, 2)
-                    bucket["vector_match"] = True
-                    matches.append(bucket)
-                    matched_ids.add(bucket_id)
-    except Exception as e:
-        rt.logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
-
-    # B4: 钉选桶不计入 max_results 名额，分开收集
-    pinned_matches = [b for b in matches if b["metadata"].get("pinned") or b["metadata"].get("protected") or b["metadata"].get("type") == "permanent"]
-    normal_matches = [b for b in matches if not (b["metadata"].get("pinned") or b["metadata"].get("protected") or b["metadata"].get("type") == "permanent")]
-    total_normal = len(normal_matches)
-    ordered_matches = pinned_matches + normal_matches[:max_results]
-    hidden_count = max(0, total_normal - max_results)
+    core_matches = [
+        b for b in matches
+        if b["metadata"].get("pinned")
+        or b["metadata"].get("protected")
+        or b["metadata"].get("type") == "permanent"
+    ]
+    regular_matches = [b for b in matches if b not in core_matches]
+    selected_matches = core_matches[:_MAX_CORE_RESULTS] + regular_matches[:max_results]
 
     results = []
     token_used = 0
-    for bucket in ordered_matches:
-        if token_used >= max_tokens:
+    budget_blocked = False
+    touched_ids: list = []   # 性能 P2：浮现后统一在后台 touch，不在响应路径逐条 await
+    for bucket in selected_matches:
+        meta = bucket["metadata"]
+        bucket_id = bucket["id"]
+        is_core = meta.get("pinned") or meta.get("protected") or meta.get("type") == "permanent"
+        if is_core:
+            header = f"📌 [核心准则] [bucket_id:{bucket_id}]"
+        elif bucket.get("vector_match"):
+            header = f"[语义关联] [bucket_id:{bucket_id}]"
+        else:
+            header = f"[bucket_id:{bucket_id}]"
+        rendered, entry_tokens = render_stored_bucket(bucket, header)
+        if token_used + entry_tokens > max_tokens:
+            budget_blocked = True
             break
-        try:
-            meta_b = bucket["metadata"]
-            is_pinned = meta_b.get("pinned") or meta_b.get("protected") or meta_b.get("type") == "permanent"
-            if mode == "summary":
-                prefix = "📌 [核心准则] " if is_pinned else ("[语义关联] " if bucket.get("vector_match") else "")
-                line = _bucket_summary_line(bucket, prefix=prefix)
-                line_tokens = count_tokens_approx(line)
-                if token_used + line_tokens > max_tokens:
-                    break
-                await rt.bucket_mgr.touch(bucket["id"])
-                results.append(line)
-                token_used += line_tokens
-            else:
-                clean_meta = {k: v for k, v in meta_b.items() if k != "tags"}
-                # --- 记忆重构：根据当前情绪微调展示层 valence（±0.1）---
-                if q_valence is not None and "valence" in clean_meta:
-                    original_v = float(clean_meta.get("valence") or 0.5)
-                    shift = (q_valence - 0.5) * 0.2
-                    clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-                summary = await rt.dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
-                # D3: 附带关联桶
-                related = meta_b.get("related") or []
-                if related:
-                    summary += f"\n关联桶: {', '.join(related)}"
-                summary_tokens = count_tokens_approx(summary)
-                if token_used + summary_tokens > max_tokens:
-                    break
-                await rt.bucket_mgr.touch(bucket["id"])
-                if is_pinned:
-                    summary = f"📌 [核心准则] [bucket_id:{bucket['id']}] {summary}"
-                elif bucket.get("vector_match"):
-                    summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
-                else:
-                    summary = f"[bucket_id:{bucket['id']}] {summary}"
-                results.append(summary)
-                token_used += summary_tokens
-        except Exception as e:
-            rt.logger.error(
-                f"Failed to dehydrate search result / 检索结果脱水失败: {type(e).__name__}: {e}",
-                exc_info=True,
-            )
-            continue
+        results.append(rendered)
+        token_used += entry_tokens
+        touched_ids.append(bucket_id)
 
-    if hidden_count > 0:
-        results.append(f"（还有 {hidden_count} 个相关桶未显示，可增大 max_results 参数查看）")
-
-    # --- 检索结果 < 3 时 40% 概率随机浮现 ---
-    if len(matches) < 3 and random.random() < 0.4:
-        try:
-            all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
-            matched_ids = {b["id"] for b in matches}
-            low_weight = [
-                b for b in all_buckets
-                if b["id"] not in matched_ids
-                and b["metadata"].get("type") not in ("feel", "plan", "letter")
-                and rt.decay_engine.calculate_score(b["metadata"]) < 2.0
-            ]
-            if low_weight:
-                drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
-                drift_results = []
-                for b in drifted:
-                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    drift_results.append(f"[surface_type: random]\n{summary}")
-                results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
-        except Exception as e:
-            rt.logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
+    # 性能 P2：把 touch 移出响应路径 —— 浮现完的桶在后台一次性更新激活，
+    # ripple=False 跳过读全库的时间涟漪。响应不再等这些写盘/涟漪。
+    if touched_ids:
+        asyncio.create_task(rt.bucket_mgr.touch_many(touched_ids, ripple=False))
 
     if not results:
+        if budget_blocked:
+            return f"{semantic_notice}\n{_BUDGET_NOTICE}" if semantic_notice else _BUDGET_NOTICE
         if rt.fire_webhook:
             await rt.fire_webhook("breath", {"mode": "empty", "matches": 0})
-        return (
+        empty_text = (
             f"没有匹配到「{query}」相关的记忆。\n"
-            "可以换个关键词试试，或不带 query 看当下权重池；feel 用 breath(domain=\"feel\")，信件用 letter_read。"
+            "可以换个关键词试试，或用 breath() 看当下权重池；feel 用 breath_advanced(domain=\"feel\")，信件用 letter_read。"
         )
+        return f"{semantic_notice}\n{empty_text}" if semantic_notice else empty_text
 
     final_text = "\n---\n".join(results)
+    notices = []
+    if semantic_notice:
+        notices.append(semantic_notice)
+    if budget_blocked:
+        notices.append(_BUDGET_NOTICE)
+    if notices:
+        final_text = "\n".join(notices + [final_text])
+    omitted = max(0, len(matches) - len(touched_ids))
+    if omitted:
+        final_text += f"\n\n还有 {omitted} 个相关桶未显示"
     if rt.fire_webhook:
-        await rt.fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})
+        await rt.fire_webhook("breath", {"mode": "ok", "matches": len(touched_ids), "chars": len(final_text)})
     return final_text

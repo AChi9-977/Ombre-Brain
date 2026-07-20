@@ -14,16 +14,24 @@ web/import_api.py — 宿主机 vault 设置 / 历史对话导入 / 桶编辑 / 
 """
 
 import os
-import io
-import json as _json_lib
 import time
 import asyncio
-import zipfile
+from datetime import datetime as _dt
 
 from starlette.requests import Request
 from starlette.responses import Response
 
 from . import _shared as sh
+
+try:
+    from utils import parse_bool  # type: ignore
+except ImportError:  # pragma: no cover
+    from ..utils import parse_bool  # type: ignore
+
+try:
+    from backup_archive import MAX_ARCHIVE_BYTES, BackupArchiveError, build_export_archive  # type: ignore
+except ImportError:  # pragma: no cover
+    from ..backup_archive import MAX_ARCHIVE_BYTES, BackupArchiveError, build_export_archive  # type: ignore
 
 logger = sh.logger
 
@@ -38,37 +46,141 @@ except ImportError:  # pragma: no cover
         check_pinned_quota as _check_pinned_quota,
     )
 
+try:
+    from import_memory import preview_import  # type: ignore
+except ImportError:  # pragma: no cover
+    from ..import_memory import preview_import  # type: ignore
+
+
+_DEFAULT_MAX_IMPORT_UPLOAD_BYTES = 64 * 1024 * 1024
+
+
+def _max_import_upload_bytes() -> int:
+    limits = (getattr(sh, "config", {}) or {}).get("limits") or {}
+    try:
+        return max(1, int(limits.get("max_import_upload_bytes") or _DEFAULT_MAX_IMPORT_UPLOAD_BYTES))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_IMPORT_UPLOAD_BYTES
+
+
+async def _read_body_limited(request: Request, limit: int) -> bytes:
+    raw_length = str((getattr(request, "headers", {}) or {}).get("content-length", "") or "").strip()
+    if raw_length:
+        try:
+            length = int(raw_length)
+        except ValueError:
+            length = 0
+        if length > limit:
+            raise ValueError(f"Upload too large ({length} bytes > {limit} byte limit)")
+
+    stream = getattr(request, "stream", None)
+    if callable(stream):
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in stream():
+            total += len(chunk)
+            if total > limit:
+                raise ValueError(f"Upload too large ({total} bytes > {limit} byte limit)")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    body = await request.body()
+    if len(body) > limit:
+        raise ValueError(f"Upload too large ({len(body)} bytes > {limit} byte limit)")
+    return body
+
+
+async def _read_file_field_limited(file_field, limit: int) -> bytes:
+    raw = await file_field.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(f"Upload too large ({len(raw)} bytes > {limit} byte limit)")
+    return raw
+
+
+async def _read_import_upload_text(request: Request) -> tuple[str, str]:
+    limit = _max_import_upload_bytes()
+    content_type = request.headers.get("content-type", "")
+    filename = ""
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        file_field = form.get("file")
+        if not file_field or isinstance(file_field, str):
+            raise ValueError("No file field")
+        raw_bytes = await _read_file_field_limited(file_field, limit)
+        filename = getattr(file_field, "filename", "upload")
+        return raw_bytes.decode("utf-8", errors="replace"), filename
+
+    body = await _read_body_limited(request, limit)
+    filename = request.query_params.get("filename", "upload")
+    return body.decode("utf-8", errors="replace"), filename
+
+
+def _import_llm_ready() -> bool:
+    engine_dehydrator = getattr(getattr(sh, "import_engine", None), "dehydrator", None)
+    if engine_dehydrator is not None:
+        return bool(getattr(engine_dehydrator, "api_available", False))
+    return bool(getattr(getattr(sh, "dehydrator", None), "api_available", False))
+
 
 def register(mcp) -> None:
 
     @mcp.custom_route("/api/host-vault", methods=["GET"])
     async def api_host_vault_get(request: Request) -> Response:
-        """Read the current OMBRE_HOST_VAULT_DIR (process env > project .env)."""
+        """Read the host-side vault path without pretending a container can change its mount."""
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
             return err
-        value = sh._read_env_var("OMBRE_HOST_VAULT_DIR")
+        compose_managed = sh.in_docker()
+        if compose_managed:
+            # A container-local .env cannot affect the host-side volume source used
+            # before this container starts. Only report the value Compose injected.
+            value = os.environ.get("OMBRE_HOST_VAULT_DIR", "").strip()
+            source = "env" if value else ""
+            env_file = None
+        else:
+            value = sh._read_env_var("OMBRE_HOST_VAULT_DIR")
+            source = "env" if os.environ.get("OMBRE_HOST_VAULT_DIR", "").strip() else ("file" if value else "")
+            env_file = sh._project_env_path()
         return JSONResponse({
             "value": value,
-            "source": "env" if os.environ.get("OMBRE_HOST_VAULT_DIR", "").strip() else ("file" if value else ""),
-            "env_file": sh._project_env_path(),
+            "source": source,
+            "env_file": env_file,
+            "compose_managed": compose_managed,
+            "message": (
+                "该挂载由宿主机 Compose 管理。请在 compose 文件旁的 .env 设置 "
+                "OMBRE_HOST_VAULT_DIR，然后执行 docker compose up -d --force-recreate。"
+                if compose_managed else ""
+            ),
         })
 
 
     @mcp.custom_route("/api/host-vault", methods=["POST"])
     async def api_host_vault_set(request: Request) -> Response:
         """
-        Persist OMBRE_HOST_VAULT_DIR to the project .env file.
+        Persist OMBRE_HOST_VAULT_DIR for non-container deployments.
         Body: {"value": "/path/to/vault"}  (empty string clears the entry)
-        Note: container restart is required for docker-compose to pick up the new mount.
+
+        Docker mounts are resolved by Compose before the container starts. Writing
+        /app/src/.env from inside that container cannot change the host mount, so
+        Docker callers receive an explicit host-managed response instead.
         """
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
             return err
+        if sh.in_docker():
+            return JSONResponse({
+                "error": (
+                    "容器无法修改宿主机的 Compose 挂载。请在 compose 文件旁的 .env 设置 "
+                    "OMBRE_HOST_VAULT_DIR，然后执行 docker compose up -d --force-recreate。"
+                ),
+                "compose_managed": True,
+                "restart_required": True,
+                "env_var": "OMBRE_HOST_VAULT_DIR",
+            }, status_code=409)
         try:
-            body = await request.json()
+            body = await sh._read_json_object(request)
         except Exception:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
@@ -90,6 +202,8 @@ def register(mcp) -> None:
             "ok": True,
             "value": value,
             "env_file": sh._project_env_path(),
+            "restart_required": True,
+            "message": "已保存 OMBRE_HOST_VAULT_DIR；需要重启容器/服务后挂载才会生效。",
             "note": "已写入 .env；需在宿主机执行 `docker compose down && docker compose up -d` 让新挂载生效。",
         })
 
@@ -98,6 +212,36 @@ def register(mcp) -> None:
     # Import API — conversation history import
     # 导入 API — 对话历史导入
     # =============================================================
+
+    @mcp.custom_route("/api/import/preflight", methods=["POST"])
+    async def api_import_preflight(request: Request) -> Response:
+        """Preview an import file without writing buckets or starting a job."""
+        from starlette.responses import JSONResponse
+        err = sh._require_auth(request)
+        if err:
+            return err
+
+        try:
+            raw_content, filename = await _read_import_upload_text(request)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"Failed to read upload: {e}"}, status_code=400)
+
+        if not raw_content.strip():
+            return JSONResponse({"ok": False, "error": "Empty file"}, status_code=400)
+
+        human_label = str((sh.config or {}).get("human") or "用户")
+        preview = preview_import(raw_content, filename=filename, human_label=human_label)
+        import_running = bool(getattr(sh.import_engine, "is_running", False))
+        llm_ready = _import_llm_ready()
+        return JSONResponse({
+            **preview,
+            "filename": filename,
+            "size_bytes": len(raw_content.encode("utf-8")),
+            "import_running": import_running,
+            "llm_ready": llm_ready,
+            "can_start": bool(preview.get("ok")) and not import_running and llm_ready,
+        })
+
 
     @mcp.custom_route("/api/import/upload", methods=["POST"])
     async def api_import_upload(request: Request) -> Response:
@@ -110,23 +254,8 @@ def register(mcp) -> None:
         if sh.import_engine.is_running:
             return JSONResponse({"error": "Import already running"}, status_code=409)
 
-        content_type = request.headers.get("content-type", "")
-        filename = ""
-
         try:
-            if "multipart/form-data" in content_type:
-                form = await request.form()
-                file_field = form.get("file")
-                if not file_field or isinstance(file_field, str):
-                    return JSONResponse({"error": "No file field"}, status_code=400)
-                raw_bytes = await file_field.read()
-                filename = getattr(file_field, "filename", "upload")
-                raw_content = raw_bytes.decode("utf-8", errors="replace")
-            else:
-                body = await request.body()
-                raw_content = body.decode("utf-8", errors="replace")
-                # Try to get filename from query params
-                filename = request.query_params.get("filename", "upload")
+            raw_content, filename = await _read_import_upload_text(request)
 
             if not raw_content.strip():
                 return JSONResponse({"error": "Empty file"}, status_code=400)
@@ -198,7 +327,10 @@ def register(mcp) -> None:
         if err:
             return err
         try:
-            limit = int(request.query_params.get("limit", "50"))
+            limit = max(1, min(int(request.query_params.get("limit", "50")), 200))
+        except (TypeError, ValueError, OverflowError):
+            return JSONResponse({"error": "limit must be an integer in [1,200]"}, status_code=400)
+        try:
             all_buckets = await sh.bucket_mgr.list_all(include_archive=False)
             # Sort by created time, newest first
             all_buckets.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
@@ -227,26 +359,50 @@ def register(mcp) -> None:
         if err:
             return err
         try:
-            body = await request.json()
+            body = await sh._read_json_object(request)
         except Exception:
             return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
         decisions = body.get("decisions", [])
-        if not decisions:
+        if not isinstance(decisions, list) or not decisions:
             return JSONResponse({"error": "No decisions provided"}, status_code=400)
+        if len(decisions) > 1000:
+            return JSONResponse({"error": "Too many review decisions (max 1000)"}, status_code=400)
+        if any(not isinstance(decision, dict) for decision in decisions):
+            return JSONResponse({"error": "Each decision must be an object"}, status_code=400)
 
         applied = 0
         errors = 0
         for d in decisions:
             bid = d.get("bucket_id", "")
             action = d.get("action", "")
+            if (
+                not isinstance(bid, str)
+                or not isinstance(action, str)
+                or len(bid) > 128
+            ):
+                errors += 1
+                continue
             if not bid or not action:
                 continue
             try:
                 if action == "important":
                     await sh.bucket_mgr.update(bid, importance=9)
                 elif action == "pin":
-                    await sh.bucket_mgr.update(bid, pinned=True)
+                    bucket = await sh.bucket_mgr.get(bid)
+                    if not bucket:
+                        errors += 1
+                        continue
+                    if not bucket.get("metadata", {}).get("pinned"):
+                        quota_err = await _check_pinned_quota()
+                        if quota_err:
+                            logger.warning(f"Review pin rejected for {bid}: {quota_err}")
+                            errors += 1
+                            continue
+                    ok = await sh.bucket_mgr.update(bid, pinned=True)
+                    if ok is False:
+                        errors += 1
+                        continue
                 elif action == "noise":
                     await sh.bucket_mgr.update(bid, resolved=True, importance=1)
                 elif action == "delete":
@@ -276,7 +432,7 @@ def register(mcp) -> None:
         if not bucket:
             return JSONResponse({"error": "bucket not found"}, status_code=404)
         try:
-            body = await request.json()
+            body = await sh._read_json_object(request)
         except Exception:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
@@ -314,11 +470,17 @@ def register(mcp) -> None:
 
         for flag in ("resolved", "digested"):
             if flag in body:
-                updates[flag] = bool(body[flag])
+                try:
+                    updates[flag] = parse_bool(body[flag])
+                except ValueError as e:
+                    return JSONResponse({"error": str(e)}, status_code=400)
 
         # pinned 需要走配额检查
         if "pinned" in body:
-            new_pinned = bool(body["pinned"])
+            try:
+                new_pinned = parse_bool(body["pinned"])
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
             cur_pinned = bool(bucket["metadata"].get("pinned", False))
             if new_pinned and not cur_pinned:
                 quota_err = await _check_pinned_quota()
@@ -355,10 +517,6 @@ def register(mcp) -> None:
                 return JSONResponse({"error": "update failed"}, status_code=500)
             if "content" in updates:
                 try:
-                    await sh.embedding_engine.generate_and_store(bucket_id, updates["content"])
-                except Exception as e:
-                    logger.warning(f"edit: re-embedding failed for {bucket_id}: {e}")
-                try:
                     sh.dehydrator.invalidate_cache(bucket["content"])
                 except Exception:
                     pass
@@ -369,7 +527,7 @@ def register(mcp) -> None:
 
     # =============================================================
     # /api/export  — 完整记忆打包导出
-    # 导出内容：所有 bucket markdown + embeddings.db + export_meta.json（含 embedding 模型信息）
+    # 导出内容：所有 bucket markdown + SQLite 一致性快照 + meta + SHA-256 清单
     # 不导出 config（避免 api_key 等密钥泄露）
     # export_meta.json 中的 embedding 字段供导入端检查模型一致性。
     # =============================================================
@@ -380,74 +538,52 @@ def register(mcp) -> None:
         if err:
             return err
 
-        import io
-        import zipfile
-
         buckets_dir = sh.config.get("buckets_dir", "")
         if not buckets_dir or not os.path.isdir(buckets_dir):
             return JSONResponse({"error": f"buckets_dir not found: {buckets_dir}"}, status_code=500)
 
-        buf = io.BytesIO()
         try:
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                # 1) bucket markdowns
-                for root, _dirs, files in os.walk(buckets_dir):
-                    for fn in files:
-                        if not fn.endswith(".md"):
-                            continue
-                        full = os.path.join(root, fn)
-                        rel = os.path.relpath(full, buckets_dir)
-                        arc = os.path.join("buckets", rel)
-                        try:
-                            zf.write(full, arc)
-                        except Exception as e:
-                            logger.warning(f"export: skip {full}: {e}")
+            emb_backend = getattr(sh.embedding_engine, "_backend", None)
+            try:
+                emb_dim = int(emb_backend.vector_dim()) if emb_backend else 0
+            except Exception:
+                emb_dim = 0
+            meta: dict = {
+                "exported_at": _dt.now().isoformat(timespec="seconds"),
+                "version": sh.version,
+                "embedding": {
+                    "model": str(getattr(sh.embedding_engine, "model", "") or ""),
+                    "dim": emb_dim,
+                    "backend": str(getattr(sh.embedding_engine, "backend", "") or ""),
+                },
+            }
+            try:
+                meta["stats"] = await sh.bucket_mgr.get_stats()
+            except Exception as exc:
+                logger.warning("export: stats unavailable: %s", exc)
 
-                # 2) embeddings.db（如果存在）
-                emb_path = sh.embedding_engine.db_path if hasattr(sh.embedding_engine, "db_path") else None
-                if emb_path and os.path.isfile(emb_path):
-                    try:
-                        zf.write(emb_path, "embeddings.db")
-                    except Exception as e:
-                        logger.warning(f"export: skip embeddings.db: {e}")
-
-                # 3) export_meta.json — 包含 embedding 模型信息，供导入端检查模型一致性
-                # 不包含 config（避免泄露 api_key 等密钥）
-                try:
-                    from datetime import datetime as _dt
-                    _emb_backend = getattr(sh.embedding_engine, "_backend", None)
-                    _emb_model = str(getattr(sh.embedding_engine, "model", "") or "")
-                    try:
-                        _emb_dim = int(_emb_backend.vector_dim()) if _emb_backend else 0
-                    except Exception:
-                        _emb_dim = 0
-                    _emb_be_name = str(getattr(sh.embedding_engine, "backend", "") or "")
-                    meta: dict = {
-                        "exported_at": _dt.now().isoformat(timespec="seconds"),
-                        "version": sh.version,
-                        "embedding": {
-                            "model": _emb_model,
-                            "dim": _emb_dim,
-                            "backend": _emb_be_name,
-                        },
-                    }
-                    # stats 失败时不影响 meta 写入（测试环境 mock 对象无法序列化）
-                    try:
-                        meta["stats"] = await sh.bucket_mgr.get_stats()
-                    except Exception:
-                        pass
-                    zf.writestr("export_meta.json", _json_lib.dumps(meta, ensure_ascii=False, indent=2))
-                except Exception as e:
-                    logger.warning(f"export: meta failed: {e}")
+            emb_path = str(getattr(sh.embedding_engine, "db_path", "") or "")
+            payload, manifest = await asyncio.to_thread(
+                build_export_archive,
+                buckets_dir,
+                emb_path,
+                meta,
+            )
+        except BackupArchiveError as e:
+            return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
         except Exception as e:
+            logger.error("export failed", exc_info=True)
             return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
 
-        buf.seek(0)
         fname = f"ombre_export_{int(time.time())}.zip"
         return StreamingResponse(
-            iter([buf.getvalue()]),
+            iter([payload]),
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{fname}"',
+                "X-Ombre-Backup-Verified": "true",
+                "X-Ombre-Backup-Files": str(manifest["file_count"]),
+            },
         )
 
 
@@ -478,9 +614,9 @@ def register(mcp) -> None:
                 file_field = form.get("file")
                 if not file_field or isinstance(file_field, str):
                     return JSONResponse({"error": "缺少 file 字段"}, status_code=400)
-                zip_bytes = await file_field.read()
+                zip_bytes = await _read_file_field_limited(file_field, MAX_ARCHIVE_BYTES)
             else:
-                zip_bytes = await request.body()
+                zip_bytes = await _read_body_limited(request, MAX_ARCHIVE_BYTES)
 
             if not zip_bytes:
                 return JSONResponse({"error": "文件为空"}, status_code=400)
@@ -526,17 +662,20 @@ def register(mcp) -> None:
             )
 
         try:
-            body = await request.json()
+            body = await sh._read_json_object(request)
         except Exception:
-            body = {}
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
         decisions: dict[str, str] = {}
         raw_decisions = body.get("decisions", {})
-        if isinstance(raw_decisions, dict):
-            valid_opts = {"skip", "overwrite", "keep_both"}
-            for bid, decision in raw_decisions.items():
-                if isinstance(bid, str) and isinstance(decision, str) and decision in valid_opts:
-                    decisions[bid] = decision
+        if not isinstance(raw_decisions, dict):
+            return JSONResponse({"error": "decisions must be an object"}, status_code=400)
+        if len(raw_decisions) > 10_000:
+            return JSONResponse({"error": "too many migration decisions"}, status_code=400)
+        valid_opts = {"skip", "overwrite", "keep_both"}
+        for bid, decision in raw_decisions.items():
+            if isinstance(bid, str) and isinstance(decision, str) and decision in valid_opts:
+                decisions[bid] = decision
 
         # 后台执行（apply 可能耗时较长，含重新向量化）
         async def _run_apply():

@@ -24,8 +24,39 @@ dream 的第一步：从全量桶里筛出「过去 window_hours 内有变动的
 from datetime import datetime, timedelta
 
 from .. import _runtime as rt
+from utils import parse_iso_datetime
 
 DREAM_MAX_CANDIDATES = 40
+
+
+def _metadata_timestamp(meta: dict) -> float:
+    value = meta.get("last_active") or meta.get("created", "")
+    try:
+        return parse_iso_datetime(value).timestamp()
+    except (ValueError, TypeError, OSError):
+        return 0.0
+
+
+def collect_core_context(all_buckets: list) -> list:
+    core = [
+        b for b in all_buckets
+        if (
+            b["metadata"].get("pinned", False)
+            or b["metadata"].get("protected", False)
+            or b["metadata"].get("type") == "permanent"
+        )
+        and b["metadata"].get("type") not in ("letter", "self", "i")
+        and not b["metadata"].get("dont_surface", False)
+    ]
+    core.sort(
+        key=lambda b: (
+            int(b["metadata"].get("importance") or 0),
+            _metadata_timestamp(b["metadata"]),
+            b.get("id", ""),
+        ),
+        reverse=True,
+    )
+    return core[:20]
 
 
 def collect_candidates(all_buckets: list, window_hours: int) -> list:
@@ -44,17 +75,14 @@ def collect_candidates(all_buckets: list, window_hours: int) -> list:
             if not ts:
                 continue
             try:
-                if datetime.fromisoformat(str(ts)) >= cutoff:
+                if parse_iso_datetime(ts) >= cutoff:
                     return True
             except (ValueError, TypeError):
                 continue
         return False
 
     recent = [b for b in candidates if _within_window(b["metadata"])]
-    recent.sort(
-        key=lambda b: b["metadata"].get("last_active") or b["metadata"].get("created", ""),
-        reverse=True,
-    )
+    recent.sort(key=lambda b: _metadata_timestamp(b["metadata"]), reverse=True)
     if len(recent) > DREAM_MAX_CANDIDATES:
         recent.sort(
             key=lambda b: rt.decay_engine.calculate_score(b["metadata"]),

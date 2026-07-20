@@ -9,7 +9,7 @@ web/config_api.py — Dashboard 配置 / 环境变量 / API Key 测试 / 模型�
 - /api/test/dehydration、/api/test/embedding：压缩 / 向量化连通性自检
 - /api/models：列目标 provider 可用模型
 - /api/env-config (GET/POST)：四块 env（compress/embed/webhook/password）热更新；
-  embedding 改动热替换 sh.embedding_engine（+ bucket_mgr/import_engine 引用）。
+  embedding 改动会原子替换所有 Web/MCP/写入/迁移运行时引用。
   webhook 不再回写模块全局——_fire_webhook 每次读 os.environ。
 
 对外暴露：register(mcp)。
@@ -17,19 +17,86 @@ web/config_api.py — Dashboard 配置 / 环境变量 / API Key 测试 / 模型�
 """
 
 import os
-import yaml
+import sys
+import secrets
 import httpx
-import json as _json_lib
 
 from starlette.requests import Request
 from starlette.responses import Response
 
 from . import _shared as sh
 
+try:
+    from utils import (  # type: ignore
+        get_ai_name as _get_ai_name,
+        get_owner_name as _get_owner_name,
+        get_owner_count as _get_owner_count,
+        positive_float as _positive_float,
+        parse_bool as _parse_bool,
+        atomic_update_config_yaml,
+    )
+except ImportError:  # pragma: no cover
+    from ..utils import (  # type: ignore
+        get_ai_name as _get_ai_name,
+        get_owner_name as _get_owner_name,
+        get_owner_count as _get_owner_count,
+        positive_float as _positive_float,
+        parse_bool as _parse_bool,
+        atomic_update_config_yaml,
+    )
+
 logger = sh.logger
+_MAX_PROVIDER_KEY_CHARS = 8192
+_MAX_PROVIDER_URL_CHARS = 2048
+_MAX_PROVIDER_FORMAT_CHARS = 64
+_MAX_ENV_VALUE_CHARS = 8192
+
+
+def _rebuild_embedding_runtime():
+    """Rebuild and publish one embedding engine to every runtime holder."""
+    try:
+        from embedding_engine import EmbeddingEngine  # type: ignore
+    except ImportError:  # pragma: no cover
+        from ..embedding_engine import EmbeddingEngine  # type: ignore
+
+    engine = EmbeddingEngine(sh.config)
+    sh.replace_embedding_engine(engine)
+    return engine
+
+
+def _persisted_mcp_auth_mode() -> str:
+    """The desired (config.yaml-level) mcp_auth_mode, not the running process's."""
+    raw = str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower()
+    return raw if raw in ("oauth", "token") else "oauth"
+
+
+def _current_mcp_token() -> str:
+    """Live static MCP token — env wins over config.yaml, same priority as validation."""
+    return (
+        os.environ.get("OMBRE_MCP_TOKEN", "").strip()
+        or str(sh.config.get("mcp_token", "") or "").strip()
+    )
+
+
+def _mask_mcp_token(token: str) -> str | None:
+    if not token:
+        return None
+    if len(token) <= 8:
+        return "***"
+    return f"{token[:4]}...{token[-4:]}"
 
 
 def register(mcp) -> None:
+    # MCP auth is bound into middleware and OAuth route visibility at process
+    # startup. Keep the effective value separate from the desired persisted
+    # value so the Dashboard cannot falsely claim a hot switch took effect.
+    runtime_mcp_auth_required = _parse_bool(
+        sh.config.get("mcp_require_auth", True), default=True
+    )
+    _runtime_mcp_auth_mode_raw = str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower()
+    runtime_mcp_auth_mode = (
+        _runtime_mcp_auth_mode_raw if _runtime_mcp_auth_mode_raw in ("oauth", "token") else "oauth"
+    )
 
     @mcp.custom_route("/dashboard", methods=["GET"])
     async def dashboard(request: Request) -> Response:
@@ -51,32 +118,38 @@ def register(mcp) -> None:
         if err:
             return err
 
-        # 启动期被平台注入的 OMBRE_* 集合（在任何 dashboard 保存 mutate os.environ 之前快照）。
+        # 启动期被平台注入的可配置 env 集合（在任何 dashboard 保存 mutate os.environ 之前快照）。
         # from_boot=True ⇒ 该变量是平台级 env，重启后会覆盖 dashboard 存进 config.yaml 的值。
-        from utils import BOOT_ENV_OMBRE
+        from utils import BOOT_ENV_CONFIG
 
         def _masked(name: str) -> dict:
             return {"set": bool(os.environ.get(name, "").strip()), "value": None,
-                    "from_boot": name in BOOT_ENV_OMBRE}
+                    "from_boot": name in BOOT_ENV_CONFIG}
 
         def _plain(name: str) -> dict:
             v = os.environ.get(name, "").strip()
-            return {"set": bool(v), "value": v or None, "from_boot": name in BOOT_ENV_OMBRE}
+            return {"set": bool(v), "value": v or None, "from_boot": name in BOOT_ENV_CONFIG}
 
         vars_data = [
             # LLM 压缩组
             {"name": "OMBRE_COMPRESS_API_KEY", "group": "llm", "label": "压缩 LLM API Key", "sensitive": True, **_masked("OMBRE_COMPRESS_API_KEY")},
             {"name": "OMBRE_COMPRESS_BASE_URL", "group": "llm", "label": "压缩 LLM Base URL", "sensitive": False, **_plain("OMBRE_COMPRESS_BASE_URL")},
             {"name": "OMBRE_COMPRESS_MODEL", "group": "llm", "label": "压缩 LLM 模型", "sensitive": False, **_plain("OMBRE_COMPRESS_MODEL")},
+            {"name": "OMBRE_COMPRESS_TIMEOUT_SECONDS", "group": "llm", "label": "压缩 LLM 超时秒数", "sensitive": False, **_plain("OMBRE_COMPRESS_TIMEOUT_SECONDS")},
             # Embedding 组
             {"name": "OMBRE_EMBED_API_KEY", "group": "embed", "label": "向量化 API Key", "sensitive": True, **_masked("OMBRE_EMBED_API_KEY")},
             {"name": "OMBRE_EMBED_BASE_URL", "group": "embed", "label": "向量化 Base URL", "sensitive": False, **_plain("OMBRE_EMBED_BASE_URL")},
             {"name": "OMBRE_EMBED_MODEL", "group": "embed", "label": "向量化模型", "sensitive": False, **_plain("OMBRE_EMBED_MODEL")},
+            {"name": "OMBRE_EMBED_TIMEOUT_SECONDS", "group": "embed", "label": "向量化超时秒数", "sensitive": False, **_plain("OMBRE_EMBED_TIMEOUT_SECONDS")},
             # 服务配置组
             {"name": "OMBRE_TRANSPORT", "group": "system", "label": "传输模式", "sensitive": False, **_plain("OMBRE_TRANSPORT")},
             {"name": "OMBRE_PORT", "group": "system", "label": "服务端口", "sensitive": False, **_plain("OMBRE_PORT")},
             {"name": "OMBRE_LOG_FILE", "group": "system", "label": "日志文件路径", "sensitive": False, **_plain("OMBRE_LOG_FILE")},
             {"name": "OMBRE_CONFIG_PATH", "group": "system", "label": "配置文件路径", "sensitive": False, **_plain("OMBRE_CONFIG_PATH")},
+            {"name": "OMBRE_MCP_REQUIRE_AUTH", "group": "auth", "label": "MCP OAuth 开关覆盖", "sensitive": False, **_plain("OMBRE_MCP_REQUIRE_AUTH")},
+            {"name": "OMBRE_MCP_AUTH_MODE", "group": "auth", "label": "MCP 鉴权模式覆盖 (oauth/token/both)", "sensitive": False, **_plain("OMBRE_MCP_AUTH_MODE")},
+            {"name": "OMBRE_MCP_TOKEN", "group": "auth", "label": "MCP 静态 Token", "sensitive": True, **_masked("OMBRE_MCP_TOKEN")},
+            {"name": "AI_NAME", "group": "identity", "label": "AI 显示名", "sensitive": False, **_plain("AI_NAME")},
             # 路径组
             {"name": "OMBRE_VAULT_DIR", "group": "paths", "label": "Vault 目录 (推荐)", "sensitive": False, **_plain("OMBRE_VAULT_DIR")},
             {"name": "OMBRE_BUCKETS_DIR", "group": "paths", "label": "桶目录 (旧版兼容)", "sensitive": False, **_plain("OMBRE_BUCKETS_DIR")},
@@ -112,11 +185,13 @@ def register(mcp) -> None:
                 "max_tokens": dehy.get("max_tokens", 1024),
                 "temperature": dehy.get("temperature", 0.1),
                 "api_format": dehy.get("api_format", "openai_compat"),
+                "timeout_seconds": dehy.get("timeout_seconds", 60),
             },
             "embedding": {
-                "enabled": emb.get("enabled", False),
+                "enabled": _parse_bool(emb.get("enabled", False), default=False),
                 "model": emb.get("model", ""),
                 "api_format": emb.get("api_format", "openai_compat"),
+                "timeout_seconds": emb.get("timeout_seconds", 30),
                 "backend": "api",
                 "backend_options": [
                     {"value": "api", "label": "Gemini API（云端）", "note": "需填 OMBRE_EMBED_API_KEY，3072 维质量最高，需联网；客户端几乎不占额外内存"},
@@ -130,6 +205,33 @@ def register(mcp) -> None:
             "merge_threshold": sh.config.get("merge_threshold", 75),
             "transport": sh.config.get("transport", "stdio"),
             "buckets_dir": sh.config.get("buckets_dir", ""),
+            # MCP OAuth 鉴权开关。默认 true（强制 OAuth）。前端「⑥ MCP 连接」面板用它
+            # 渲染一键开关；关掉后 /mcp 免认证直连（供自有前端 / GPT / GLM 等）。
+            "mcp_require_auth": _parse_bool(
+                sh.config.get("mcp_require_auth", True), default=True
+            ),
+            "mcp_require_auth_effective": runtime_mcp_auth_required,
+            # 鉴权模式（仅 mcp_require_auth=true 时有意义）："oauth"（默认）或 "token"，二者互斥。
+            "mcp_auth_mode": _persisted_mcp_auth_mode(),
+            "mcp_auth_mode_effective": runtime_mcp_auth_mode,
+            # 静态 Token 状态：只回掩码/是否已配置，绝不回明文。
+            "mcp_token_configured": bool(_current_mcp_token()),
+            "mcp_token_hint": _mask_mcp_token(_current_mcp_token()),
+            "restart_required": (
+                _parse_bool(sh.config.get("mcp_require_auth", True), default=True)
+                != runtime_mcp_auth_required
+                or _persisted_mcp_auth_mode() != runtime_mcp_auth_mode
+            ),
+            # 部署信息：数据目录 + 端口 + 是否容器内。前端「系统」区展示，端口可改。
+            "host_port": sh.config.get("host_port"),
+            "in_docker": sh.in_docker(),
+            # AI 一方的显示名（取自环境变量 AI_NAME，回退 "AI"）。前端只读，用于
+            # 面向用户的文案（如删除确认、信件署名占位）。
+            "ai_name": _get_ai_name(),
+            # 记忆归属：多人共用一套 OB 时标明「这份记忆是谁的」。owner_count>=2 时
+            # 前端顶部才显示归属徽标（单人不打扰）；owner_name 为徽标文字。均只读。
+            "owner_name": _get_owner_name(),
+            "owner_count": _get_owner_count(),
         })
 
 
@@ -144,14 +246,80 @@ def register(mcp) -> None:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
 
         updated = []
+        try:
+            persist_requested = _parse_bool(body.get("persist", False))
+            mcp_auth_value = (
+                _parse_bool(body["mcp_require_auth"])
+                if "mcp_require_auth" in body
+                else None
+            )
+            mcp_auth_mode_value = None
+            if "mcp_auth_mode" in body:
+                mcp_auth_mode_value = str(body["mcp_auth_mode"]).strip().lower()
+                if mcp_auth_mode_value not in ("oauth", "token"):
+                    return JSONResponse(
+                        {"error": "mcp_auth_mode must be 'oauth' or 'token'"},
+                        status_code=400,
+                    )
+            embedding_payload = body.get("embedding")
+            if "embedding" in body and not isinstance(embedding_payload, dict):
+                return JSONResponse(
+                    {"error": "embedding must be an object"}, status_code=400
+                )
+            if "dehydration" in body and not isinstance(
+                body.get("dehydration"), dict
+            ):
+                return JSONResponse(
+                    {"error": "dehydration must be an object"}, status_code=400
+                )
+            if "surfacing" in body and not isinstance(body.get("surfacing"), dict):
+                return JSONResponse(
+                    {"error": "surfacing must be an object"}, status_code=400
+                )
+            embedding_enabled = (
+                _parse_bool(embedding_payload["enabled"])
+                if isinstance(embedding_payload, dict)
+                and "enabled" in embedding_payload
+                else None
+            )
+            embedding_backend = None
+            if isinstance(embedding_payload, dict) and "backend" in embedding_payload:
+                backend_raw = str(embedding_payload["backend"]).strip().lower()
+                embedding_backend = (
+                    "api" if backend_raw in ("api", "gemini") else backend_raw
+                )
+                if embedding_backend != "api":
+                    return JSONResponse(
+                        {"error": f"unsupported embedding backend: {backend_raw}"},
+                        status_code=400,
+                    )
+            sampling_payload = None
+            if isinstance(body.get("surfacing"), dict):
+                candidate = body["surfacing"].get("sampling")
+                if candidate is not None and not isinstance(candidate, dict):
+                    return JSONResponse(
+                        {"error": "surfacing.sampling must be an object"},
+                        status_code=400,
+                    )
+                sampling_payload = candidate
+            sampling_enabled = (
+                _parse_bool(sampling_payload["enabled"])
+                if isinstance(sampling_payload, dict)
+                and "enabled" in sampling_payload
+                else None
+            )
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
 
         # --- Dehydration config ---
         if "dehydration" in body:
             d = body["dehydration"]
             dehy = sh.config.setdefault("dehydration", {})
-            for key in ("model", "base_url", "max_tokens", "temperature", "api_format"):
+            for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds"):
                 if key in d:
                     dehy[key] = d[key]
                     updated.append(f"dehydration.{key}")
@@ -163,6 +331,7 @@ def register(mcp) -> None:
             sh.dehydrator.base_url = dehy.get("base_url", sh.dehydrator.base_url)
             sh.dehydrator.max_tokens = int(dehy.get("max_tokens") or sh.dehydrator.max_tokens)
             sh.dehydrator.temperature = float(dehy.get("temperature") or sh.dehydrator.temperature)
+            sh.dehydrator.timeout_seconds = _positive_float(dehy.get("timeout_seconds"), sh.dehydrator.timeout_seconds)
             sh.dehydrator.api_format = dehy.get("api_format", getattr(sh.dehydrator, "api_format", "openai_compat"))
             if "api_key" in d and d["api_key"]:
                 sh.dehydrator.api_key = dehy["api_key"]
@@ -173,54 +342,78 @@ def register(mcp) -> None:
                 sh.dehydrator.client = AsyncOpenAI(
                     api_key=sh.dehydrator.api_key,
                     base_url=sh.dehydrator.base_url,
-                    timeout=60.0,
+                    timeout=sh.dehydrator.timeout_seconds,
                 )
             else:
                 sh.dehydrator.client = None
 
         # --- Embedding config ---
         if "embedding" in body:
-            e = body["embedding"]
+            e = embedding_payload
             emb = sh.config.setdefault("embedding", {})
-            if "enabled" in e:
-                emb["enabled"] = bool(e["enabled"])
-                sh.embedding_engine.enabled = emb["enabled"]
+            rebuild_embedding = False
+            if embedding_enabled is not None:
+                emb["enabled"] = embedding_enabled
                 updated.append("embedding.enabled")
+                rebuild_embedding = True
             if "model" in e:
                 emb["model"] = e["model"]
-                sh.embedding_engine.model = emb["model"]
-                if sh.embedding_engine._backend:
-                    sh.embedding_engine._backend.model = emb["model"]  # type: ignore[attr-defined]
                 updated.append("embedding.model")
+                rebuild_embedding = True
+            if "timeout_seconds" in e:
+                emb["timeout_seconds"] = e["timeout_seconds"]
+                updated.append("embedding.timeout_seconds")
+                rebuild_embedding = True
             if "api_format" in e:
                 emb["api_format"] = str(e["api_format"]).strip()
-                # 重建后端以应用新格式
-                try:
-                    from embedding_engine import EmbeddingEngine as _EE
-                except ImportError:
-                    from ..embedding_engine import EmbeddingEngine as _EE
-                sh.embedding_engine = _EE(sh.config)
                 updated.append("embedding.api_format")
-            if "backend" in e:
-                new_backend_raw = str(e["backend"]).strip().lower()
-                # 只支持 api backend，其他值直接拒绝
-                new_backend = "api" if new_backend_raw in ("api", "gemini") else new_backend_raw
-                if new_backend == "api":
-                    emb["backend"] = new_backend
-                    # 注意：这里仅热替换运行时引擎实例，不做 embeddings.db 迁移。
-                    # 如需重算所有向量，请显式调用 POST /api/embedding/migrate。
-                    try:
-                        from embedding_engine import EmbeddingEngine
-                    except ImportError:
-                        from ..embedding_engine import EmbeddingEngine
-                    sh.embedding_engine = EmbeddingEngine(sh.config)
-                    updated.append("embedding.backend")
+                rebuild_embedding = True
+            if embedding_backend is not None:
+                emb["backend"] = embedding_backend
+                updated.append("embedding.backend")
+                rebuild_embedding = True
+
+            # One request may change several fields. Rebuild once, then publish
+            # the same instance to web routes, BucketManager, ImportEngine and
+            # the MCP tools runtime so reads and writes cannot split models.
+            if rebuild_embedding:
+                try:
+                    _rebuild_embedding_runtime()
+                except Exception as e:
+                    return JSONResponse(
+                        {"error": f"embedding reload failed: {e}"},
+                        status_code=400,
+                    )
 
         # --- Merge threshold ---
         if "merge_threshold" in body:
             try:
                 sh.config["merge_threshold"] = int(body["merge_threshold"])
                 updated.append("merge_threshold")
+            except (TypeError, ValueError):
+                pass
+
+        # --- MCP OAuth 鉴权开关（mcp_require_auth）---
+        # 注意：该值在进程启动时被读入 server.py 的 MCP 鉴权中间件闭包，运行时改
+        # sh.config 不会即时生效，必须 persist 到 config.yaml 后重启进程才真正切换。
+        # 这里仍同步 sh.config，让 /api/config GET 能回显「已保存、待重启生效」的值。
+        if mcp_auth_value is not None:
+            sh.config["mcp_require_auth"] = mcp_auth_value
+            updated.append("mcp_require_auth")
+
+        # --- MCP 鉴权模式（mcp_auth_mode）--- 同上，也是启动期闭包值，热改不即时生效。
+        if mcp_auth_mode_value is not None:
+            sh.config["mcp_auth_mode"] = mcp_auth_mode_value
+            updated.append("mcp_auth_mode")
+
+        # --- 对外端口（host_port）---
+        # 裸机：写 config 后进程自重启即监听新端口（前端「保存并重启」）。
+        # Docker：容器内端口由 Dockerfile 固定，host_port 仅供部署脚本读取注入
+        # OMBRE_HOST_PORT，须重建容器才生效（前端会提示）。
+        if "host_port" in body:
+            try:
+                sh.config["host_port"] = int(body["host_port"])
+                updated.append("host_port")
             except (TypeError, ValueError):
                 pass
 
@@ -241,21 +434,14 @@ def register(mcp) -> None:
                         pass
 
         # --- Persist to config.yaml if requested ---
-        if body.get("persist", False):
-            from utils import config_file_path
-            config_path = config_file_path()
-            try:
-                save_config: dict[str, object] = {}
-                if os.path.exists(config_path):
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        save_config = yaml.safe_load(f) or {}
-
+        if persist_requested:
+            def _mutate(save_config: dict) -> None:
                 if "dehydration" in body:
                     sc_dehy = save_config.setdefault("dehydration", {})
                     if not isinstance(sc_dehy, dict):
                         sc_dehy = {}
                         save_config["dehydration"] = sc_dehy
-                    for key in ("model", "base_url", "max_tokens", "temperature", "api_format"):
+                    for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds"):
                         if key in body["dehydration"]:
                             sc_dehy[key] = body["dehydration"][key]
                     # Never persist api_key to yaml (use env var)
@@ -265,13 +451,29 @@ def register(mcp) -> None:
                     if not isinstance(sc_emb, dict):
                         sc_emb = {}
                         save_config["embedding"] = sc_emb
-                    for key in ("enabled", "model", "api_format"):
+                    for key in ("model", "api_format", "timeout_seconds"):
                         if key in body["embedding"]:
                             sc_emb[key] = body["embedding"][key]
+                    if embedding_enabled is not None:
+                        sc_emb["enabled"] = embedding_enabled
+                    if embedding_backend is not None:
+                        sc_emb["backend"] = embedding_backend
 
                 if "merge_threshold" in body:
                     try:
                         save_config["merge_threshold"] = int(body["merge_threshold"])
+                    except (TypeError, ValueError):
+                        pass
+
+                if mcp_auth_value is not None:
+                    save_config["mcp_require_auth"] = mcp_auth_value
+
+                if mcp_auth_mode_value is not None:
+                    save_config["mcp_auth_mode"] = mcp_auth_mode_value
+
+                if "host_port" in body:
+                    try:
+                        save_config["host_port"] = int(body["host_port"])
                     except (TypeError, ValueError):
                         pass
 
@@ -292,8 +494,8 @@ def register(mcp) -> None:
                             sc_samp = {}
                             sc_sf["sampling"] = sc_samp
                         src_samp = body["surfacing"]["sampling"]
-                        if "enabled" in src_samp:
-                            sc_samp["enabled"] = bool(src_samp["enabled"])
+                        if sampling_enabled is not None:
+                            sc_samp["enabled"] = sampling_enabled
                         for key in ("top_k", "sample_k"):
                             if key in src_samp:
                                 try:
@@ -306,13 +508,70 @@ def register(mcp) -> None:
                             except (TypeError, ValueError):
                                 pass
 
-                with open(config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(save_config, f, default_flow_style=False, allow_unicode=True)
+            try:
+                atomic_update_config_yaml(_mutate)
                 updated.append("persisted_to_yaml")
             except Exception as e:
                 return JSONResponse({"error": f"persist failed: {e}", "updated": updated}, status_code=500)
 
-        return JSONResponse({"updated": updated, "ok": True})
+        restart_required = (
+            (mcp_auth_value is not None and mcp_auth_value != runtime_mcp_auth_required)
+            or (mcp_auth_mode_value is not None and mcp_auth_mode_value != runtime_mcp_auth_mode)
+        )
+        return JSONResponse({
+            "updated": updated,
+            "ok": True,
+            "restart_required": restart_required,
+            "mcp_require_auth_effective": runtime_mcp_auth_required,
+            "mcp_auth_mode_effective": runtime_mcp_auth_mode,
+            "message": (
+                "MCP 鉴权设置已保存，需要重启服务后生效。"
+                if restart_required else "设置已生效。"
+            ),
+        })
+
+
+    # =============================================================
+    # /api/mcp-token/regenerate — 生成/轮换 mcp_auth_mode=token 用的静态密钥
+    # 独立成一个小路由（而不是塞进 POST /api/config）：生成新密钥和改配置项
+    # 是两件不同的事，参照 oauth.py 里 token 签发自成一块的做法。
+    # =============================================================
+    @mcp.custom_route("/api/mcp-token/regenerate", methods=["POST"])
+    async def api_mcp_token_regenerate(request: Request) -> Response:
+        """(Re)generate the static MCP token and persist it to config.yaml.
+
+        Returns the plaintext token exactly once — GET /api/config only ever
+        returns a masked hint, so the Dashboard must capture this response.
+        Takes effect immediately (no restart needed): _is_valid_static_mcp_token
+        reads sh.config/env fresh on every request.
+        """
+        from starlette.responses import JSONResponse
+        err = sh._require_auth(request)
+        if err:
+            return err
+
+        new_token = secrets.token_urlsafe(32)
+        sh.config["mcp_token"] = new_token
+
+        try:
+            atomic_update_config_yaml(lambda save_config: save_config.__setitem__("mcp_token", new_token))
+        except Exception as e:
+            return JSONResponse({"error": f"persist failed: {e}"}, status_code=500)
+
+        env_override = bool(os.environ.get("OMBRE_MCP_TOKEN", "").strip())
+        return JSONResponse({
+            "ok": True,
+            "token": new_token,
+            "token_hint": _mask_mcp_token(new_token),
+            "env_override": env_override,
+            "message": (
+                "环境变量 OMBRE_MCP_TOKEN 优先级更高，已生成的新密钥暂不会生效，"
+                "请改用该环境变量或先取消设置它。"
+                if env_override
+                else "新 Token 已生成并保存，请立即复制；刷新页面后不再显示完整值。"
+                     "重新生成立即生效，无需重启。"
+            ),
+        })
 
 
     # =============================================================
@@ -398,13 +657,22 @@ def register(mcp) -> None:
         if err:
             return err
         try:
-            body = await request.json()
+            body = await sh._read_json_object(request)
         except Exception:
             return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
 
+        provider_fields = ("api_key", "base_url", "api_format")
+        if any(key in body and not isinstance(body[key], str) for key in provider_fields):
+            return JSONResponse({"ok": False, "error": "provider fields must be strings"}, status_code=400)
         api_key = str(body.get("api_key", "")).strip()
         base_url = str(body.get("base_url", "")).strip()
         api_format = str(body.get("api_format", "openai_compat")).strip().lower()
+        if (
+            len(api_key) > _MAX_PROVIDER_KEY_CHARS
+            or len(base_url) > _MAX_PROVIDER_URL_CHARS
+            or len(api_format) > _MAX_PROVIDER_FORMAT_CHARS
+        ):
+            return JSONResponse({"ok": False, "error": "provider configuration is too large"}, status_code=400)
 
         # Sentinel "__use_current__": use server-side key from dehydration config
         if api_key == "__use_current__":
@@ -467,20 +735,25 @@ def register(mcp) -> None:
         "OMBRE_COMPRESS_BASE_URL": {"group": "compress", "sensitive": False, "in_memory": ("dehydration", "base_url")},
         "OMBRE_COMPRESS_MODEL":    {"group": "compress", "sensitive": False, "in_memory": ("dehydration", "model")},
         "OMBRE_COMPRESS_FORMAT":   {"group": "compress", "sensitive": False, "in_memory": ("dehydration", "api_format")},
+        "OMBRE_COMPRESS_TIMEOUT_SECONDS": {"group": "compress", "sensitive": False, "in_memory": ("dehydration", "timeout_seconds")},
         # Embed / 向量化（backend 切换走 /api/embedding/migrate）
         "OMBRE_EMBED_API_KEY":     {"group": "embed",    "sensitive": True,  "in_memory": ("embedding", "api_key")},
         "OMBRE_EMBED_BASE_URL":    {"group": "embed",    "sensitive": False, "in_memory": ("embedding", "base_url")},
         "OMBRE_EMBED_MODEL":       {"group": "embed",    "sensitive": False, "in_memory": ("embedding", "model")},
         "OMBRE_EMBED_FORMAT":      {"group": "embed",    "sensitive": False, "in_memory": ("embedding", "api_format")},
+        "OMBRE_EMBED_TIMEOUT_SECONDS": {"group": "embed", "sensitive": False, "in_memory": ("embedding", "timeout_seconds")},
         # Webhook
         "OMBRE_HOOK_URL":          {"group": "webhook",  "sensitive": False, "in_memory": None},
         "OMBRE_HOOK_SKIP":         {"group": "webhook",  "sensitive": False, "in_memory": None},
+        # Identity / display labels
+        "AI_NAME":                 {"group": "identity", "sensitive": False, "in_memory": None},
     }
 
     _ENV_CONFIG_NOTE = {
         "compress": "改完即时生效（进程内 sh.config 已更新），同时写 config.yaml 持久化（重启后仍有效）。",
         "embed": "API key / base_url / model 立即更新进程内 config；backend 切换请用「切换 / 重算所有 embedding…」按钮。",
         "webhook": "改完下次 breath/dream 触发时即生效，无需重启。",
+        "identity": "AI 显示名立即生效；若由平台环境变量注入，重启后仍会被平台值覆盖。",
     }
 
 
@@ -554,13 +827,15 @@ def register(mcp) -> None:
             return err
 
         try:
-            body = await request.json()
+            body = await sh._read_json_object(request)
         except Exception:
             return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
 
         updates: dict = body.get("updates", {})
         if not isinstance(updates, dict) or not updates:
             return JSONResponse({"ok": False, "error": "updates 必须是非空对象"}, status_code=400)
+        if len(updates) > len(_ENV_CONFIG_FIELDS):
+            return JSONResponse({"ok": False, "error": "updates 字段过多"}, status_code=400)
 
         written: list[str] = []
         errors: list[str] = []
@@ -571,6 +846,9 @@ def register(mcp) -> None:
                 continue
             if not isinstance(val, str):
                 errors.append(f"{var}: 值必须是字符串，跳过")
+                continue
+            if len(val) > _MAX_ENV_VALUE_CHARS:
+                errors.append(f"{var}: 值超过 {_MAX_ENV_VALUE_CHARS} 字符，跳过")
                 continue
             # 拒绝明显的注入字符
             if "\n" in val or "\r" in val:
@@ -596,31 +874,36 @@ def register(mcp) -> None:
             else:
                 os.environ.pop(var, None)
 
-            # 3. 持久化到 config.yaml（bind mount，重建不丢）
-            try:
-                from utils import config_file_path
-                _cfg_path = config_file_path()
-                _save: dict = {}
-                if os.path.exists(_cfg_path):
-                    with open(_cfg_path, "r", encoding="utf-8") as _f:
-                        _save = yaml.safe_load(_f) or {}
-                if meta["in_memory"]:
-                    section, key = meta["in_memory"]
-                    _save.setdefault(section, {})[key] = value
-                with open(_cfg_path, "w", encoding="utf-8") as _f:
-                    yaml.dump(_save, _f, allow_unicode=True, default_flow_style=False)
-            except Exception as e:
-                errors.append(f"{var}: 写 config.yaml 失败：{e}")
-                continue
+            # 2.5. 纯 env 字段没有 config.yaml 映射，写入项目 .env 作为持久化来源。
+            if not meta["in_memory"]:
+                try:
+                    sh._write_env_var(var, value)
+                except Exception as e:
+                    errors.append(f"{var}: 写 .env 失败：{e}")
+                    continue
+
+            # 3. 持久化到 config.yaml（bind mount，重建不丢）——纯 env 字段
+            #    （meta["in_memory"] 为空）在 config.yaml 里没有映射，已经在
+            #    上面 2.5 写进 .env 了，这里没有可写的东西，跳过即可。
+            if meta["in_memory"]:
+                section, key = meta["in_memory"]
+                try:
+                    atomic_update_config_yaml(
+                        lambda save_config, _section=section, _key=key: save_config.setdefault(_section, {}).__setitem__(_key, value)
+                    )
+                except Exception as e:
+                    errors.append(f"{var}: 写 config.yaml 失败：{e}")
+                    continue
 
 
             # 5. Compress 配置变更 → 同步到 dehydrator 实例，重建 client
-            if var in ("OMBRE_COMPRESS_API_KEY", "OMBRE_COMPRESS_BASE_URL", "OMBRE_COMPRESS_MODEL", "OMBRE_COMPRESS_FORMAT"):
+            if var in ("OMBRE_COMPRESS_API_KEY", "OMBRE_COMPRESS_BASE_URL", "OMBRE_COMPRESS_MODEL", "OMBRE_COMPRESS_FORMAT", "OMBRE_COMPRESS_TIMEOUT_SECONDS"):
                 try:
                     dehy_cfg = sh.config.get("dehydration", {})
                     sh.dehydrator.api_key = dehy_cfg.get("api_key", sh.dehydrator.api_key)  # type: ignore[attr-defined]
                     sh.dehydrator.base_url = dehy_cfg.get("base_url", sh.dehydrator.base_url)  # type: ignore[attr-defined]
                     sh.dehydrator.model = dehy_cfg.get("model", sh.dehydrator.model)  # type: ignore[attr-defined]
+                    sh.dehydrator.timeout_seconds = _positive_float(dehy_cfg.get("timeout_seconds"), getattr(sh.dehydrator, "timeout_seconds", 60.0))  # type: ignore[attr-defined]
                     sh.dehydrator.api_format = dehy_cfg.get("api_format", getattr(sh.dehydrator, "api_format", "openai_compat"))  # type: ignore[attr-defined]
                     sh.dehydrator.api_available = bool(sh.dehydrator.api_key)  # type: ignore[attr-defined]
                     if sh.dehydrator.api_available and sh.dehydrator.api_format == "openai_compat":  # type: ignore[attr-defined]
@@ -628,7 +911,7 @@ def register(mcp) -> None:
                         sh.dehydrator.client = _OAI_DH(  # type: ignore[attr-defined]
                             api_key=sh.dehydrator.api_key,
                             base_url=sh.dehydrator.base_url,
-                            timeout=60.0,
+                            timeout=sh.dehydrator.timeout_seconds,
                         )
                     else:
                         sh.dehydrator.client = None  # type: ignore[attr-defined]
@@ -636,28 +919,20 @@ def register(mcp) -> None:
                     pass
 
             # 6. Embed 配置变更 → 完整重建 embedding_engine
-            if var in ("OMBRE_EMBED_API_KEY", "OMBRE_EMBED_BASE_URL", "OMBRE_EMBED_MODEL", "OMBRE_EMBED_FORMAT"):
+            if var in ("OMBRE_EMBED_API_KEY", "OMBRE_EMBED_BASE_URL", "OMBRE_EMBED_MODEL", "OMBRE_EMBED_FORMAT", "OMBRE_EMBED_TIMEOUT_SECONDS"):
                 try:
                     sh.config.setdefault("embedding", {})
                     # key 被清空 → 禁用
                     if var == "OMBRE_EMBED_API_KEY" and not value:
                         sh.embedding_engine._backend = None  # type: ignore[attr-defined]
                         sh.embedding_engine.enabled = False
+                        sh.replace_embedding_engine(sh.embedding_engine)
                     else:
                         try:
                             from embedding_engine import EmbeddingEngine as _EE_hot
                         except ImportError:
                             from ..embedding_engine import EmbeddingEngine as _EE_hot
-                        sh.embedding_engine = _EE_hot(sh.config)
-                        # 更新 bucket_mgr / import_engine 持有的引用
-                        try:
-                            sh.bucket_mgr.embedding_engine = sh.embedding_engine  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-                        try:
-                            sh.import_engine.embedding_engine = sh.embedding_engine  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
+                        sh.replace_embedding_engine(_EE_hot(sh.config))
                 except Exception:
                     pass
 
@@ -672,3 +947,78 @@ def register(mcp) -> None:
         if errors:
             response["warnings"] = errors
         return JSONResponse(response)
+
+
+    # --- 传输模式热切换：streamable-http / stdio / sse（legacy）---
+    # transport 是「启动时绑定」的（server.py 据此起 streamable_http_app / sse_app / stdio），
+    # 运行中无法无缝切换，所以这里的做法是：持久化新值 → 原地自重启（os.execv 继承已改的
+    # os.environ，绕过 compose 里硬编码的旧 OMBRE_TRANSPORT）→ 新进程按新 transport 起。
+    _TRANSPORT_CHOICES = ("streamable-http", "sse", "stdio")
+
+    @mcp.custom_route("/api/transport", methods=["POST"])
+    async def api_transport_set(request: Request) -> Response:
+        """切换 MCP 传输模式并自重启生效。
+
+        Body (JSON): {"transport": "streamable-http" | "sse" | "stdio"}
+
+        ⚠️ stdio 没有 HTTP 服务：切到 stdio 后 Dashboard / REST / /mcp(HTTP) 全部消失，
+        且无法再从网页切回（需在服务器改 config.yaml / env 恢复）。前端对此二次确认。
+        """
+        from starlette.responses import JSONResponse
+        err = sh._require_auth(request)
+        if err:
+            return err
+        try:
+            body = await sh._read_json_object(request)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
+
+        new_t = str(body.get("transport") or "").strip()
+        if new_t not in _TRANSPORT_CHOICES:
+            return JSONResponse(
+                {"ok": False, "error": f"transport 必须是 {list(_TRANSPORT_CHOICES)} 之一"},
+                status_code=400,
+            )
+
+        current = str(sh.config.get("transport", "stdio"))
+        if new_t == current:
+            return JSONResponse({"ok": True, "transport": new_t, "restarting": False,
+                                 "note": "传输模式未变化，无需重启。"})
+
+        # 1. 运行时 config + os.environ（os.execv 自重启会继承 environ，
+        #    从而盖过 docker-compose 里硬编码的旧 OMBRE_TRANSPORT）。
+        sh.config["transport"] = new_t
+        os.environ["OMBRE_TRANSPORT"] = new_t
+
+        # 2. 持久化到项目 .env（compose 若以 ${OMBRE_TRANSPORT} 引用则容器重建也保留）。
+        env_persisted = True
+        try:
+            sh._write_env_var("OMBRE_TRANSPORT", new_t)
+        except Exception:
+            env_persisted = False
+
+        # 3. 持久化到 config.yaml（裸机 / 无 env 覆盖时的权威来源）。
+        try:
+            atomic_update_config_yaml(lambda saved: saved.__setitem__("transport", new_t))
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"写 config.yaml 失败：{e}"}, status_code=500)
+
+        # 4. 延迟自重启，让本次响应先回到前端（参照 /api/do-update 的重启节奏）。
+        import threading
+
+        def _do_restart() -> None:
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception:
+                os._exit(0)
+
+        threading.Timer(1.0, _do_restart).start()
+        logger.info(f"[transport] 切换 {current} → {new_t}，1s 后自重启生效")
+        return JSONResponse({
+            "ok": True,
+            "transport": new_t,
+            "previous": current,
+            "restarting": True,
+            "env_persisted": env_persisted,
+            "loses_http": new_t == "stdio",
+        })

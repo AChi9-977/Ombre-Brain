@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from utils import count_tokens_approx, now_iso
+from utils import atomic_write_text, clean_llm_json, count_tokens_approx, now_iso, parse_bool
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -50,7 +50,12 @@ _STATE_ERR_LOG_MAX = 100       # errors 数组最多保留条数（避免状态�
 _CHUNK_ERR_PREVIEW = 200       # 单 chunk 错误信息截断长度
 
 # --- _extract_memories LLM 调用 ---
-_EXTRACT_INPUT_LIMIT = 12000   # chunk 内容传给 LLM 的上限
+# chunk_turns() 已经把块的大小控制在 ~_CHUNK_TARGET_TOKENS token 附近，只有单轮
+# 超大文本才会摸到 _CHUNK_TARGET_TOKENS × _CHUNK_OVERSIZE_RATIO 这个上限（见
+# chunk_turns 里「单轮超限单独成块」的分支）。这里按 token 数而不是固定字符数
+# 判断要不要截断——旧的固定 12000 字符对英文/中英混合内容而言远小于块本身的
+# token 预算，会把块后半段正文在不留任何痕迹的情况下悄悄丢给 LLM 看不到。
+_EXTRACT_TOKEN_CEILING = int(_CHUNK_TARGET_TOKENS * _CHUNK_OVERSIZE_RATIO)
 _EXTRACT_MAX_TOKENS = 2048
 _EXTRACT_TEMPERATURE = 0.0     # 提取需确定性
 _PARSE_ERR_PREVIEW = 200       # JSON 解析失败时日志预览
@@ -106,11 +111,8 @@ def _clamp_importance(meta: dict) -> int:
 
 
 def _strip_md_fence(raw: str) -> str:
-    """剥掉 LLM 偊尔会包的 ```...``` 代码块外壳（与 dehydrator 内部同款）。"""
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-    return cleaned
+    """Backwards-compatible wrapper for tolerant LLM JSON extraction."""
+    return clean_llm_json(raw)
 
 
 # ============================================================
@@ -350,6 +352,97 @@ def chunk_turns(turns: list[dict], target_tokens: int = _CHUNK_TARGET_TOKENS, hu
     return chunks
 
 
+def _detect_preview_format(raw_content: str, filename: str, warnings: list[str]) -> str:
+    ext = Path(filename).suffix.lower() if filename else ""
+    stripped = raw_content.strip()
+
+    if ext == ".md":
+        return "markdown"
+    if ext in (".txt", ".jsonl"):
+        return "text"
+
+    if ext == ".json" or stripped.startswith(("{", "[")):
+        try:
+            data = json.loads(stripped)
+            sample = data[0] if isinstance(data, list) and data else data
+            if isinstance(sample, dict):
+                if "chat_messages" in sample:
+                    return "claude_json"
+                if "mapping" in sample:
+                    return "chatgpt_json"
+                if "messages" in sample:
+                    return "chat_json"
+                if "role" in sample and "content" in sample:
+                    return "chat_json"
+            return "json"
+        except (json.JSONDecodeError, TypeError, IndexError):
+            warnings.append("JSON 解析失败，已按纯文本继续预检")
+            return "text"
+
+    return "markdown" if "\n" in raw_content else "text"
+
+
+def preview_import(raw_content: str, filename: str = "", human_label: str = "用户") -> dict[str, Any]:
+    """Return a local-only preview of an import file without mutating state."""
+    warnings: list[str] = []
+    if not raw_content or not raw_content.strip():
+        return {
+            "ok": False,
+            "error": "Empty file",
+            "detected_format": "",
+            "turns_count": 0,
+            "chunks_count": 0,
+            "estimated_api_calls": 0,
+            "warnings": ["文件为空"],
+        }
+
+    detected_format = _detect_preview_format(raw_content, filename, warnings)
+    turns = detect_and_parse(raw_content, filename)
+    if not turns:
+        return {
+            "ok": False,
+            "error": "No conversation turns found",
+            "detected_format": detected_format,
+            "turns_count": 0,
+            "chunks_count": 0,
+            "estimated_api_calls": 0,
+            "warnings": warnings,
+        }
+
+    chunks = chunk_turns(turns, human_label=human_label)
+    if not chunks:
+        return {
+            "ok": False,
+            "error": "No processable chunks after splitting",
+            "detected_format": detected_format,
+            "turns_count": len(turns),
+            "chunks_count": 0,
+            "estimated_api_calls": 0,
+            "warnings": warnings,
+        }
+
+    token_estimate = sum(count_tokens_approx(chunk.get("content", "")) for chunk in chunks)
+    first_preview = chunks[0].get("content", "")[:600]
+    return {
+        "ok": True,
+        "detected_format": detected_format,
+        "turns_count": len(turns),
+        "chunks_count": len(chunks),
+        "estimated_api_calls": len(chunks),
+        "estimated_tokens": token_estimate,
+        "warnings": warnings,
+        "first_chunk_preview": first_preview,
+        "sample_turns": [
+            {
+                "role": str(turn.get("role", "")),
+                "content": str(turn.get("content", ""))[:160],
+                "timestamp": str(turn.get("timestamp", "")),
+            }
+            for turn in turns[:3]
+        ],
+    }
+
+
 # ============================================================
 # Import State — persistent progress tracking
 # 导入状态 — 持久化进度追踪
@@ -390,11 +483,13 @@ class ImportState:
     def save(self):
         """Persist state to file."""
         self.data["updated_at"] = now_iso()
-        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-        tmp = self.state_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.state_file)
+        # 断点续传整个功能都靠这个文件在崩溃后存活：用 utils.atomic_write_text
+        # 而不是手写 open/write/replace——后者既不 fsync（真断电不保证落盘），
+        # 也不带 Windows 长路径前缀（import_state.json 直接在 buckets_dir 下，
+        # 深层安装路径会超 260 字符 MAX_PATH）。
+        atomic_write_text(
+            self.state_file, json.dumps(self.data, ensure_ascii=False, indent=2)
+        )
 
     def reset(self, source_file: str, source_hash: str, total_chunks: int):
         """Reset state for a new import."""
@@ -525,24 +620,41 @@ class ImportEngine:
         self._paused = False
 
         try:
-            source_hash = hashlib.sha256(raw_content.encode()).hexdigest()[:_STATE_HASH_HEX]
+            _human = self.config.get("human", "用户")
+            # source_hash 必须把 human_label 也算进去：chunk_turns() 把它拼进每一行
+            # 再数 token，边界完全由它决定。只按 raw_content 算哈希的话，暂停期间
+            # config.yaml 的 human 字段被改过，恢复时会重新切出一份不同的 chunk
+            # 列表，但 state.data["processed"] 原样复用——要么跳过内容，要么用
+            # 错位的切片重复处理。哈希带上 human_label 后，这种情况会被下面的
+            # "source_hash 不一致" 分支识别为「源变了」，走全新导入而不是错位续传。
+            source_hash = hashlib.sha256(
+                f"{_human}\x00{raw_content}".encode()
+            ).hexdigest()[:_STATE_HASH_HEX]
 
             # Check for resume
             if resume and self.state.load() and self.state.can_resume:
                 if self.state.data["source_hash"] == source_hash:
-                    logger.info(
-                        f"Resuming import from chunk "
-                        f"{self.state.data['processed']}/{self.state.data['total_chunks']}"
-                    )
                     # Re-parse and re-chunk to get the same chunks
                     turns = detect_and_parse(raw_content, filename)
-                    _human = self.config.get("human", "用户")
                     self._chunks = chunk_turns(turns, human_label=_human)
-                    self.state.data["status"] = "running"
-                    self.state.save()
-                    return await self._process_chunks(preserve_raw)
+                    if len(self._chunks) == self.state.data["total_chunks"]:
+                        logger.info(
+                            f"Resuming import from chunk "
+                            f"{self.state.data['processed']}/{self.state.data['total_chunks']}"
+                        )
+                        self.state.data["status"] = "running"
+                        self.state.save()
+                        return await self._process_chunks(preserve_raw)
+                    # 哈希对得上，但重新切出来的 chunk 数量对不上——分块逻辑本身
+                    # 依赖的某个输入（非 raw_content/human，理论上不该发生）变了。
+                    # 宁可整个重来，也不能拿旧的 processed 索引去配一份不同的切片。
+                    logger.warning(
+                        "Resumed chunk count mismatch "
+                        f"(state={self.state.data['total_chunks']}, "
+                        f"recomputed={len(self._chunks)}); starting fresh import"
+                    )
                 else:
-                    logger.warning("Source file changed, starting fresh import")
+                    logger.warning("Source file or human label changed, starting fresh import")
 
             # Fresh import
             turns = detect_and_parse(raw_content, filename)
@@ -550,7 +662,6 @@ class ImportEngine:
                 self._running = False
                 return {"error": "No conversation turns found in file"}
 
-            _human = self.config.get("human", "用户")
             self._chunks = chunk_turns(turns, human_label=_human)
             if not self._chunks:
                 self._running = False
@@ -631,8 +742,24 @@ class ImportEngine:
                 should_preserve = preserve_raw or item.get("preserve_raw", False)
 
                 if should_preserve:
+                    # preserve_raw 桶不走 _merge_or_create_item 的查重（原文必须逐字
+                    # 保留，不能被 LLM 摘要合并）；但进度只在整个 chunk 处理完才落盘
+                    # （_process_chunks 里 processed=i+1），崩溃重启后同一个 chunk 会
+                    # 从头重新提取一遍，之前已经落盘的 preserve_raw 条目就会被原样
+                    # 再建一份。这里用精确内容匹配挡掉重复——preserve_raw 的定义就是
+                    # 「逐字原文」，完全相同的正文已经存在就是同一条，不是新记忆。
+                    exact_finder = getattr(self.bucket_mgr, "find_exact_content", None)
+                    if callable(exact_finder):
+                        try:
+                            if exact_finder(item["content"], domain_filter=item.get("domain") or None):
+                                continue
+                        except Exception as exc:
+                            logger.warning(
+                                f"[import] preserve_raw duplicate check failed, "
+                                f"proceeding to store: {exc}"
+                            )
                     # Raw mode: store original content without summarization
-                    bucket_id = await self.bucket_mgr.create(
+                    await self.bucket_mgr.create(
                         content=item["content"],
                         tags=item.get("tags", []),
                         importance=item.get("importance", _DEFAULT_IMPORTANCE),
@@ -641,7 +768,6 @@ class ImportEngine:
                         arousal=item.get("arousal", _DEFAULT_AROUSAL),
                         name=item.get("name"),
                     )
-                    await self._safe_embed(bucket_id, item["content"])
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
                 else:
@@ -658,7 +784,13 @@ class ImportEngine:
                     pass
 
             except Exception as e:
-                logger.warning(f"Failed to store memory: {item.get('name', '?')}: {e}")
+                err_msg = f"Failed to store memory {item.get('name', '?')!r}: {e}"
+                logger.warning(err_msg)
+                # 不记 state.errors 的话，/api/import/status 只会看到
+                # memories_created/merged 计数比 api_calls 少，却查不出为什么——
+                # LLM 提取失败已经在记了，存储失败没道理不记。
+                if len(self.state.data["errors"]) < _STATE_ERR_LOG_MAX:
+                    self.state.data["errors"].append(err_msg[:_CHUNK_ERR_PREVIEW])
 
     async def _extract_memories(self, chunk_content: str) -> list[dict]:
         """Use LLM to extract memories from a conversation chunk."""
@@ -669,9 +801,23 @@ class ImportEngine:
         _human = self.config.get("human", "用户")
         prompt = IMPORT_EXTRACT_PROMPT.replace("用户", _human) if _human != "用户" else IMPORT_EXTRACT_PROMPT
 
+        trimmed_content = chunk_content
+        total_tokens = count_tokens_approx(chunk_content)
+        if total_tokens > _EXTRACT_TOKEN_CEILING:
+            # 按当前内容的字符/token 比例估算要保留的字符数，而不是死板的固定
+            # 字符上限——中英文混合内容每 token 对应的字符数差异很大。
+            ratio = len(chunk_content) / max(1, total_tokens)
+            approx_chars = max(1, int(_EXTRACT_TOKEN_CEILING * ratio))
+            trimmed_content = chunk_content[:approx_chars]
+            logger.warning(
+                "[import] chunk content exceeds extraction token ceiling, truncating: "
+                f"{len(chunk_content)} chars (~{total_tokens} tokens) → "
+                f"{len(trimmed_content)} chars (~{count_tokens_approx(trimmed_content)} tokens)"
+            )
+
         raw = await self.dehydrator._chat(
             prompt,
-            chunk_content[:_EXTRACT_INPUT_LIMIT],
+            trimmed_content,
             max_tokens=_EXTRACT_MAX_TOKENS,
             temperature=_EXTRACT_TEMPERATURE,
         )
@@ -709,26 +855,15 @@ class ImportEngine:
                 "arousal": arousal,
                 "tags": [str(t) for t in item.get("tags", [])][:_TAGS_MAX],
                 "importance": importance,
-                "preserve_raw": bool(item.get("preserve_raw", False)),
-                "is_pattern": bool(item.get("is_pattern", False)),
+                "preserve_raw": parse_bool(
+                    item.get("preserve_raw", False), default=False
+                ),
+                "is_pattern": parse_bool(
+                    item.get("is_pattern", False), default=False
+                ),
             })
 
         return validated
-
-    async def _safe_embed(self, bucket_id: str, content: str) -> None:
-        """Fire-and-forget embedding：失败静默，不中断导入主流程。
-
-        4 处需要生成 embedding 的地方都走这个 helper，避免重复的
-        try/except Exception: pass 样板。
-        """
-        if not self.embedding_engine:
-            return
-        try:
-            await self.embedding_engine.generate_and_store(bucket_id, content)
-        except Exception as e:
-            # 降级允许：embedding 失败不影响桶落盘；后续可通过 backfill_embeddings.py 补全。
-            # 参见 rule.md §2.4 / §6 OB-E001。
-            logger.warning(f"_safe_embed: bucket={bucket_id} embedding 生成失败（允许降级）: {e}")
 
     async def _merge_or_create_item(self, item: dict) -> bool:
         """Try to merge with existing bucket, or create new. Returns is_merged."""
@@ -768,14 +903,13 @@ class ImportEngine:
                         valence=round((old_v + valence) / 2, 2),
                         arousal=round((old_a + arousal) / 2, 2),
                     )
-                    await self._safe_embed(bucket["id"], merged)
                     return True
                 except Exception as e:
                     logger.warning(f"Merge failed during import: {e}")
                     self.state.data["api_calls"] += 1
 
         # Create new
-        bucket_id = await self.bucket_mgr.create(
+        await self.bucket_mgr.create(
             content=content,
             tags=tags,
             importance=importance,
@@ -784,7 +918,6 @@ class ImportEngine:
             arousal=arousal,
             name=name or None,
         )
-        await self._safe_embed(bucket_id, content)
         return False
 
     async def detect_patterns(self) -> list[dict]:

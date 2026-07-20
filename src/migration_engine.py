@@ -19,6 +19,8 @@ migration_engine.py — embedding 迁移引擎（2.0.3 新增）
 - 不做 bucket 迁移、桶文件重写
 - 不切换 global embedding_engine —— 那是 server.py 调用方的事
 - 不做配置写盘
+- 不做"导入别的 OB 实例导出的完整备份包"——那是 migrate_engine.py 的事。
+  两个文件名高度相似，改代码前务必确认自己改的是哪一个。
 ========================================
 """
 
@@ -55,6 +57,16 @@ TAIL_LOG_LINES = 15
 # 进程级锁：同一时刻只允许一个迁移任务
 _migration_lock = threading.Lock()
 _migration_task: asyncio.Task | None = None
+_v3_runtime: Any = None
+
+
+def attach_v3_runtime(runtime) -> None:
+    global _v3_runtime
+    _v3_runtime = runtime
+
+
+def get_v3_runtime():
+    return _v3_runtime
 
 
 # ============================================================
@@ -116,27 +128,79 @@ def write_status(status_path: str, status: dict[str, Any]) -> None:
         logger.warning(f"[migration] failed to write status: {e}")
 
 
-def _read_checkpoint(path: str) -> set[str]:
+def target_signature(target_backend: str, target_model: str, target_dim: int) -> str:
+    """迁移目标的唯一签名：断点续传只在「跟上次同一个目标」时才生效。
+
+    checkpoint 原来只存 done_ids，不记目标是谁——先迁到 backend A 失败一半，
+    再改迁到 backend B，会把 A 模型的 done_ids 当成 B 已完成，连带复用同一份
+    staging db 里 A 的向量，直接原子替换进主库。签名不一致就必须整个重来。
+    """
+    return f"{target_backend}:{target_model}:{target_dim}"
+
+
+def _read_checkpoint(path: str, signature: str) -> set[str]:
     if not os.path.exists(path):
         return set()
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        done = data.get("done_ids", []) if isinstance(data, dict) else []
+        if not isinstance(data, dict):
+            return set()
+        if data.get("target_signature") != signature:
+            return set()
+        done = data.get("done_ids", [])
         return set(done) if isinstance(done, list) else set()
     except (OSError, json.JSONDecodeError):
         return set()
 
 
-def _write_checkpoint(path: str, done_ids: Iterable[str]) -> None:
+def _write_checkpoint(path: str, done_ids: Iterable[str], signature: str) -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"done_ids": sorted(done_ids)}, f, ensure_ascii=False)
+            json.dump(
+                {"done_ids": sorted(done_ids), "target_signature": signature},
+                f, ensure_ascii=False,
+            )
         os.replace(tmp, path)
     except OSError as e:
         logger.warning(f"[migration] failed to write checkpoint: {e}")
+
+
+def staging_db_path_for(db_path: str) -> str:
+    """迁移过程中间向量只写这个文件，绝不碰 live db，直到全部成功才原子替换。"""
+    return f"{db_path}.migrating"
+
+
+def reset_stale_migration_state(buckets_dir: str, db_path: str, signature: str) -> None:
+    """启动新一轮迁移前调用：checkpoint 目标签名对不上就整个清掉。
+
+    必须在调用方构造 target_engine（从而在 staging db 路径上跑
+    ``_init_db()``）**之前**调用，否则会在一份带着上一个目标模型向量的
+    staging db 上继续写，签名检查形同虚设。
+    """
+    ckpt_path = checkpoint_path_for(buckets_dir)
+    if not os.path.exists(ckpt_path):
+        return
+    try:
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        stale = not isinstance(data, dict) or data.get("target_signature") != signature
+    except (OSError, json.JSONDecodeError):
+        stale = True
+    if not stale:
+        return
+    try:
+        os.remove(ckpt_path)
+    except OSError:
+        pass
+    staging_path = staging_db_path_for(db_path)
+    try:
+        if os.path.exists(staging_path):
+            os.remove(staging_path)
+    except OSError as e:
+        logger.warning(f"[migration] failed to remove stale staging db {staging_path}: {e}")
 
 
 def _tail_errors_log(buckets_dir: str, n: int = TAIL_LOG_LINES) -> list[str]:
@@ -234,7 +298,8 @@ async def _run_migration(
         return
 
     total = len(buckets)
-    done_ids = _read_checkpoint(ckpt_path)  # 断点续传
+    signature = target_signature(cfg.target_backend, cfg.target_model, cfg.target_dim)
+    done_ids = _read_checkpoint(ckpt_path, signature)  # 断点续传（目标不一致则整个重来）
     failed_items: list[dict[str, str]] = []
     failed_count = 0
 
@@ -281,7 +346,7 @@ async def _run_migration(
                     })
 
         # 每批写一次 checkpoint + status
-        _write_checkpoint(ckpt_path, done_ids)
+        _write_checkpoint(ckpt_path, done_ids, signature)
         cur = read_status(status_path)
         cur["done"] = len(done_ids)
         cur["failed_count"] = failed_count
@@ -293,12 +358,36 @@ async def _run_migration(
         if i + BATCH_SIZE < len(pending):
             await asyncio.sleep(BATCH_INTERVAL_SEC)
 
-    # 4) 收尾：只要核心流程没崩，整体算 completed（失败条记在列表里）
+    # 4) 全部成功才原子替换进主库——docstring 承诺的「先写 .migrating，全部跑完
+    #    再原子 swap」真正落地点。循环全程只写 cfg.target_engine 自己的 staging
+    #    db（由调用方在构造 target_engine 时把 db_path 指到 staging_db_path_for()
+    #    返回的路径），从未碰过 cfg.db_path，所以任何一步失败/崩溃，live db
+    #    都还是迁移前的样子，不会出现新旧模型向量混杂的半截状态。
+    all_done = failed_count == 0 and len(done_ids) >= total
+    swap_error = ""
+    if all_done:
+        staged_path = getattr(cfg.target_engine, "db_path", "")
+        if staged_path and os.path.abspath(staged_path) != os.path.abspath(cfg.db_path):
+            try:
+                os.replace(staged_path, cfg.db_path)
+                # 后续任何用这个 target_engine 发起的操作都必须落在刚替换好的
+                # live 路径——继续指着已经被 rename 走的旧 staging 路径，下一次
+                # sqlite3.connect() 会在那里悄悄建一个空库，看起来"正常"实则
+                # 全部向量重新归零。
+                cfg.target_engine.db_path = cfg.db_path
+            except OSError as e:
+                swap_error = f"{type(e).__name__}: {e}"
+                logger.error(f"[migration] atomic swap staging→live failed: {swap_error}")
+
     finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-    final_phase = "completed"
-    final_msg = f"迁移完成：{len(done_ids)} 成功 / {failed_count} 失败"
+    success = all_done and not swap_error
+    final_phase = "completed" if success else "failed"
+    if swap_error:
+        final_msg = f"迁移全部完成但原子替换主库失败，向量仍留在暂存文件：{swap_error}"
+    else:
+        final_msg = f"迁移完成：{len(done_ids)} 成功 / {failed_count} 失败"
     tail = []
-    if failed_count > 0:
+    if failed_count > 0 or swap_error:
         # 失败时附 log + 引导提示
         tail = _tail_errors_log(cfg.buckets_dir)
 
@@ -307,25 +396,28 @@ async def _run_migration(
         "phase": final_phase,
         "current_id": "",
         "done": len(done_ids),
-        "failed_count": failed_count,
+        "failed_count": failed_count if not swap_error else max(failed_count, 1),
         "failed_items": failed_items,
         "finished_at": finished_at,
         "message": final_msg,
+        "error": swap_error,
         "tail_log": tail,
     })
     write_status(status_path, cur)
 
     # 成功后把 embeddings_meta 更新为目标后端的 model/dim，
     # 否则 db_meta 还是旧值（如 gemini/768），重启会误报 OB-W005 维度不一致。
-    if failed_count == 0:
+    if success:
         try:
             cfg.target_engine._write_meta("model_name", cfg.target_model or "")
             cfg.target_engine._write_meta("vector_dim", str(cfg.target_dim or 0))
         except Exception as e:
             logger.warning(f"[migration] update meta failed: {e}")
 
-    # 完成后清掉 checkpoint（下次切换从头开始）
-    if failed_count == 0:
+    # 完成后清掉 checkpoint（下次切换从头开始）——只有真正 swap 成功才清，
+    # swap 失败时必须留着，好让下次重试从断点续传，而不是把 staging db 里
+    # 已经算完的向量再重算一遍。
+    if success:
         try:
             if os.path.exists(ckpt_path):
                 os.remove(ckpt_path)
@@ -334,7 +426,7 @@ async def _run_migration(
 
     if on_complete:
         try:
-            on_complete(failed_count == 0)
+            on_complete(success)
         except Exception as e:
             logger.warning(f"[migration] on_complete callback failed: {e}")
 
@@ -391,6 +483,8 @@ __all__ = [
     "start_migration",
     "is_running",
     "reset_for_test",
+    "attach_v3_runtime",
+    "get_v3_runtime",
     "BATCH_SIZE",
     "BATCH_INTERVAL_SEC",
 ]

@@ -65,7 +65,8 @@ Ombre-Brain/
 ├── Dockerfile          # 根目录保留（平台自动识别）
 ├── render.yaml         # 根目录保留（Render 自动识别）
 ├── zbpack.json         # 根目录保留（Zeabur 自动识别）
-├── requirements.txt    # 根目录保留（pip 标准位置）
+├── requirements.txt / requirements.lock.txt  # 直接依赖源 / 发布安装锁
+├── requirements-dev.in / requirements-dev.lock.txt  # CI 与审计工具源 / 锁
 ├── config.example.yaml / config.yaml
 ├── README.md / LICENSE / rule.md
 └── .env                # 不进 git
@@ -76,9 +77,9 @@ Ombre-Brain/
 
 ```
                     ┌──────────────┐
-                    │  src/server.py │  MCP 入口（薄封装）+ 双连接器装配 + 起服编排（约 1022 行）
+                    │  src/server.py │  MCP 入口（薄封装）+ 引擎构建 + 进程启动
                     └─────┬───────┘
-              注入 _runtime │  装配 web.register_all(mcp)
+              注入 _runtime │  装配 web.register_all(mcp) / server_app.build_http_app()
            ┌──────────────┴──────────────────────────────┐
            ▼                                              ▼
   ┌─────────────────────────────┐      ┌───────────────────────────────┐
@@ -106,7 +107,7 @@ Ombre-Brain/
 
 每个模块「干什么、边界在哪、依赖谁」：
 
-- **server.py**（约 1022 行）— MCP 服务入口。创建所有组件后调 `tools._runtime.init(...)` 注入依赖；以 `@mcp.tool()` / `@mcp_extra.tool()` 注册 **12 个薄封装**（每个 ≤ 10 行，只转发到 `tools/<名字>/`），分挂在 **双连接器** `mcp`(/mcp，5 高频) 与 `mcp_extra`(/mcp-extra，7 低频) 上（详见 §3 抬头）；启动段调 `web.register_all(mcp)` 装配所有 HTTP 路由，并把两个 `streamable_http_app()` 合并到一个 uvicorn 进程。**不写业务逻辑，也不再直接定义 HTTP 路由**——后者已全部迁到 `web/`。
+- **server.py**（约 1000 行）— MCP 服务入口。创建所有组件后调 `tools._runtime.init(...)` 注入依赖；以 `@mcp.tool()` / `@mcp_extra.tool()` 注册 **14 个薄封装**（每个 ≤ 10 行，只转发到 `tools/<名字>/`）；启动入口处把 `mcp_extra` 的 7 个工具回灌进 `mcp`，对外只暴露 **单连接器 `/mcp`**（14 工具全在这一条，详见 §3 抬头）；启动段调 `web.register_all(mcp)` 装配所有 HTTP 路由，并起 `mcp.streamable_http_app()` 一个 uvicorn 进程。**不写业务逻辑，也不再直接定义 HTTP 路由**——后者已全部迁到 `web/`。
 - **tools/**（MCP 工具应用层）— 详见下面「1.x tools/ 包结构」。
 - **web/**（HTTP/Dashboard 路由层）— 详见下面「1.y web/ 包结构」。从旧 server.py 巨石里拆出的 16 个域模块，每个导出 `register(mcp)`；cookie/CSRF/会话鉴权等共享依赖在 `web/_shared.py`（类比 `tools/_runtime.py`）。
 - **bucket_manager.py** — 桶 CRUD + 多维加权搜索 + `touch()` 激活刷新 + `_time_ripple()` 时间涟漪 + 文件搬运（archive/permanent 之间）。
@@ -115,13 +116,13 @@ Ombre-Brain/
 - **embedding_engine.py** — 「门面 + 后端」两层向量化：后端只有**一个 OpenAI 兼容 API 实现**（默认 Gemini 云端）；门面负责 SQLite 存取、余弦搜索、孤儿对账、模型/维度一致性校验（不一致记 OB-W005，不阻止启动）。**本地离线向量化**不是另一个后端，而是把 `base_url` 指向 OB 托管的 Ollama 边车（bge-m3，由 `web/ollama_local.py` 拉起子进程）。旧文档的「bge-small-zh / sentence-transformers 懒加载」已废弃。
 - **bm25_index.py** — BM25 稀疏检索（jieba 中文分词），给 `bucket_manager.search()` 提供 TF-IDF 加权的关键词召回（Dim 7）。`rank_bm25` / `jieba` 是软依赖，未装则静默 no-op，不影响其余维度；索引由 BucketManager 持有，写后脏标记、search 时懒重建。
 - **import_memory.py** — Claude JSON / ChatGPT / DeepSeek / Markdown / 纯文本五种格式的历史对话导入，分块处理 + 断点续传 + 词频规律检测。
-- **migrate_engine.py** — 完整记忆包导入：把 `/api/export` 产生的 zip（buckets/*.md + embeddings.db + export_meta.json）增量 merge 进当前系统；识别 ID 冲突（skip/overwrite/keep_both），embedding 模型不一致时只导 md 再重算。
+- **backup_archive.py** — 本地备份格式：读取 Markdown、用 SQLite backup API 生成一致性快照、写 `backup_manifest.json`（逐文件 size + SHA-256）；导入前限制 ZIP 文件数/体积/压缩率并拒绝路径穿越、重复路径、损坏清单。
+- **migrate_engine.py** — 完整记忆包导入：把 `/api/export` 产生的 zip 增量 merge 进当前系统；识别 ID 冲突（skip/overwrite/keep_both），兼容新旧 embedding schema。模型不一致或快照缺向量时写入耐久 outbox，不把网络调用放在恢复事务里。旧版无清单包可兼容导入，但状态明确标记为未验证。
+- **vault_health.py** — Dashboard 与 `tools/check_buckets.py` 共用的只读健康检查：Markdown 解析、重复 ID、越界软链接、SQLite `quick_check`、孤儿向量、缺失且未进入 outbox 的向量。
 - **migration_engine.py** — embedding 后端切换（local ↔ api）时后台全量重算向量：先写 `embeddings.db.migrating`、跑完原子 swap；断点续传 + 失败跳过 + 进度文件供前端轮询。
 - **github_sync.py** — 把 `buckets_dir` 下的 .md 经 GitHub Git Trees API 批量提交做云端备份（不传 embeddings.db）；支持手动 + 定时自动同步。路由在 `web/github.py`。
 - **reclassify_api.py** — 一次性脚本：把历史落在「未分类/」的桶重新 `analyze()` 打标并搬到正确 domain 目录，只改 frontmatter 与文件位置。
 - **errors.py** — OB 统一错误码（如 OB-W005 embedding 模型漂移、OB-Startup 系列），供各模块抛结构化异常。
-- **desire_engine.py** — 欲望引擎纯函数内核：八维驱动条（attachment/curiosity/reflection/duty/social/fatigue/libido/stress，fatigue 是闸不是欲望）+ 念头池（闪念↔执念，衰减/升级/发作反哺/了却出池）+ pick_intent/satisfy（乘性回落+不应期）+ 耦合网（|k|≤0.06+全局阻尼）+ wildcard 泄洪 + 想念基线漂移（**双安全阀**：封顶 clamp(HOME, 0.5)、她一次互动 floor 拉回 60%）+ 自主心跳间隔 + 自我驱动（**平衡阀**：她的快通道 master_delta 不许因自驱调低；presence_bonus 保证她一句话让依恋重夺最高意图）。不碰 IO、不取系统时间（时间戳由调用方传入）。v2.6.0 加观察层只读镜子：`affect()`（PA/NA + 效价×唤醒落点，焦虑/兴奋/闷/温柔四象限；想念按分开时长暖→酸拆分计入 PA/NA）与 `sync_info()`（同步/漂移：presence 在场=贴着，按 idle 朝 100% 漂）——不参与意图排序、不反哺任何维、不改状态（有 purity 测试）。测试：tests/test_desire.py（方向性 + 200 拍有界性 + 感情机制红线测试 + 观察层）。**改动红线：master_delta / presence_bonus / baseline_drift_cap / baseline_pullback_ratio 这些碰感情的常数，红线测试不绿不许合。**
-- **desire_runtime.py** — 欲望引擎接线层（IO/心跳/事件映射）：状态原子写到 `<buckets_dir>/.desire_state.json`；asyncio 心跳任务在 lifespan 与 decay 同级启动；`server.py::_with_notice` 每次工具调用成功后 `on_tool_event(op, args)` 喂事件（全程吞错）；每 3 拍从真实桶采样念头（active plan→duty、近 72h feel→reflection、未解决 imp≥7→按 domain 猜维度），念头 text 只读成关键词/强度、绝不拼进 prompt。gates 全走环境变量：`OMBRE_DESIRE_ENABLED`（默认 on）/ `OMBRE_DESIRE_DRIVEN`（行为覆盖总闸，默认 **off**=只读可看不动手；开后浮现模式 breath 尾部附「此刻」一行）/ `OMBRE_DESIRE_COUPLING` / `OMBRE_DESIRE_BASELINE_DRIFT` / `OMBRE_HEARTBEAT_AUTONOMY` / `OMBRE_DESIRE_SELF_DRIVE`（默认 on）/ `OMBRE_DESIRE_TZ_OFFSET`（默认 +8；安静时段 23–9 点心跳 floor 1800s 不打扰）。只读接口 `GET /api/desire/state`（web/desire.py）；MCP `pulse` 尾部附「=== 我此刻 ===」快照；dashboard「心」tab 渲染。v2.6.0 加「最近被戳到」事件流水：`on_tool_event` 里例行疲劳消耗先打（不记），快照 drives、处理完 diff，|Δ|≥0.01 的维度带第一人称 note + args 摘录（≤60 字）记入 `self.events`（上限 40，随 .desire_state.json 持久化）；心跳里执念发作也记一笔（delta=None）。/state 返回 `sync` / `affect` / `events`（最新 12 条）。
 
 > **第一人称豁免**：`import_memory.py` 在喂给 LLM 的 prompt 里把对话格式化成 `[用户] ... [AI] ...` 文本块（[src/import_memory.py](src/import_memory.py) `_chunk_turns` 第 291 行），这是给 LLM 看的「对话块」标签，不是写入桶 frontmatter 或返回给模型的 docstring，因此不违反 §2.9 第一人称原则。修改这段时勿误删。
 > **导入阈值**：`_PATTERN_MIN_DYNAMIC_BUCKETS = 5` / `_PATTERN_PIN_SUGGEST_THRESHOLD = 5`，详见 rule.md §6 备注。
@@ -168,7 +169,7 @@ src/web/
 ├── plans.py        # /api/plans(+/{id}/action) 看板
 ├── letters.py      # /api/letters / /api/letter 信件
 ├── hooks.py        # /breath-hook / /dream-hook（SessionStart 等 HTTP 钩子）+ Webhook
-├── buckets.py      # /api/buckets(+ pin/resolve/archive/forget/anchor/purge/edit/DELETE)
+├── buckets.py      # /api/buckets(+ pin/resolve/archive/forget/anchor/edit/DELETE；保留已退役 purge 拒绝端点)
 ├── import_api.py   # /api/import/*（上传 / 进度 / 暂停 / 规律 / 审阅）
 ├── github.py       # /api/github/*（GitHub 备份同步，封装 github_sync.py）
 ├── embedding.py    # /api/embedding/*（info / migrate / local 模型管理）
@@ -182,7 +183,7 @@ src/web/
 
 ### 辅助脚本
 
-`tools/backfill_embeddings.py`（为存量桶补 embedding）、`src/write_memory.py`（CLI 直写记忆，绕过 MCP）、`tools/reclassify_domains.py` / `src/reclassify_api.py`（重新打标）、`tools/check_buckets.py`（数据完整性检查）、`tools/check_icloud_conflicts.py`（iCloud 同步冲突文件清理）。
+`tools/backfill_embeddings.py`（为存量桶补 embedding）、`src/write_memory.py`（CLI 直写记忆，绕过 MCP）、`tools/reclassify_domains.py` / `src/reclassify_api.py`（重新打标）、`tools/check_buckets.py`（数据完整性检查）、`tools/check_icloud_conflicts.py`（iCloud 同步冲突文件清理）、`tools/evaluate_retrieval.py`（用显式 query→bucket 期望只读计算 Hit@K / Recall@K / MRR，默认不调用 embedding）。
 
 ---
 
@@ -206,12 +207,15 @@ hold / grow（Claude 决策）
        bucket_mgr.search(content, limit=1, domain_filter)
               │
        score > merge_threshold(75)?
-        ├─ 是 → dehydrator.merge() → bucket_mgr.update() → 更新 embedding
-        └─ 否 → bucket_mgr.create() → embedding_engine.generate_and_store()
+        ├─ 是 → dehydrator.merge() → bucket_mgr.update()
+        └─ 否 → bucket_mgr.create()
               │
               ▼
        写入 buckets/dynamic/{domain}/{name}_{id}.md
        activation_count = 0   ← 关键：创建时为 0，touch() 才会变 1+
+              │
+              └─→ embedding outbox（只存 id + content hash）
+                        └─ 后台单 worker 生成向量；失败指数退避、重启后续跑
               │
               ▼
        存活期：每次 breath(query) 命中 → bucket_mgr.touch()
@@ -261,24 +265,29 @@ feel 桶自身：
 
 ---
 
-## 3. MCP 工具规格（共 12 个）
+## 3. MCP 工具规格（共 14 个）
 
-> **双连接器拆分（iter 2.1）**：因 claude.ai MCP 连接器有 5 工具上限，工具拆到两个 FastMCP 实例上：
-> - 主 `mcp`（`/mcp`）：高频 5 个 —— `breath` / `hold` / `grow` / `trace` / `dream`
-> - 副 `mcp_extra`（`/mcp-extra`）：低频 7 个 —— `anchor` / `release` / `pulse` / `plan` / `letter_write` / `letter_read` / `I`
->
-> 两实例共享同一进程/runtime/bucket_mgr。streamable-http 下两个 `streamable_http_app()` 合并进一个 uvicorn（`/mcp` + `/mcp-extra`）；stdio/sse 单连接器无 5 工具上限，启动时把 `mcp_extra` 的 7 个工具回灌进 `mcp`，全部 12 个仍在同一连接器暴露（兼容旧 Claude Desktop 配置）。
+> **单连接器（iter 2.2）**：claude.ai 的 5 工具上限已解除，14 个工具合并回一个连接器 `/mcp`。
+> 历史上（iter 2.1）曾因该上限拆成主 `mcp`（`/mcp`，5 个）+ 副 `mcp_extra`（`/mcp-extra`，7 个）两个 FastMCP 实例。
+> 现在 `mcp_extra` 仅作工具分组容器保留（7 个 `@mcp_extra.tool()` 注册不动），启动入口处统一把它的工具
+> 回灌进 `mcp`，三种 transport（stdio / sse / streamable-http）都只对外暴露一条 `/mcp`。
+> - 高频 7 个 —— `breath` / `breath_search` / `breath_advanced` / `hold` / `grow` / `trace` / `dream`
+> - 低频 7 个 —— `anchor` / `release` / `pulse` / `plan` / `letter_write` / `letter_read` / `I`
 
-### 3.1 `breath` — 检索/浮现
+### 3.1 `breath` / `breath_search` / `breath_advanced` — 检索/浮现
 
-签名：`breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_results=20, importance_min=-1, tags="")`
+三个入口共用同一个内部实现 `tools/breath/dispatch()`，只是 MCP 层暴露的参数面不同（见 issue #17：claude.ai 按需加载工具时会跳过参数复杂的工具，单个 9 参数的 `breath` 会导致它常年加载不上，拆薄之后 `breath()` 能保证每次对话稳定自动加载）：
 
-四种模式（按代码内判定顺序）：
+- **`breath()`** — 0 参数。等价于 `dispatch()` 全默认，即下面的「浮现模式」。日常每次对话开头调用。
+- **`breath_search(query, domain="", max_results=0, date_from="", date_to="")`** — 检索入口。日期参数使用 `YYYY-MM-DD`，按稳定的 `updated_at` 过滤。
+- **`breath_advanced(..., catalog=False, date_from="", date_to="")`** — 完整参数版；保留 catalog/tags/importance/情感/token 预算并增加日期过滤。
 
-1. **Feel 通道**（`domain="feel"` 或 `tags` 含 `"feel"`/`"__feel__"`）：直接拉所有 `type==feel` 桶，按 `created` 倒序展示原文，按 `surfacing.feel_max_tokens`（默认 6000）做 token 预算；**超出预算的旧 feel 折叠为 60 字符单行摘要**，并在末尾追加 `更早的 feel 摘要（N 条，已折叠）` 段。**不排除 anchor 桶**（设计：feel 通道只看 type=feel）。
-2. **重要度批量模式**（`importance_min >= 1`）：跳过语义搜索，按 importance 降序返回 ≤20 条；过滤 `feel/plan/letter` 与 `dont_surface=True`；**不过滤 anchor、不过滤 pinned**（设计：主动按 importance 检索时希望能找到所有重要桶）。
-3. **浮现模式**（无 `query`）：钉选桶始终展示为「核心准则」+ 未解决桶按衰减分排序，**冷启动**（`activation_count==0 && importance>=8`）的桶最多 2 个插到最前；后续排序**有两条互斥路径**：当 `surfacing.sampling.enabled=true` 时走加权无放回采样（`top_k` / `sample_k` / `temperature` 控制；详见 §7.1），否则走原 Top-1 固定 + Top-2~20 随机洗牌；按 `max_results` 硬截断。**排除 anchor 桶**（设计：anchor 是坐标系，不该随机冒泡干扰日常浮现；这是浮现模式独有的过滤）。浮现**不调用** `touch()`。**末尾追加 `=== 久未浮现 ===`** 段（iter 1.6 §7 被动联想）：从 `activation_count==0 && importance>=8` 或 `importance>=9 && 距 last_active>7天` 的桶里随机抽 1~2 条，模拟「突然想起来」。
-4. **检索模式**（有 `query`）：四维加权评分 → 过滤 `feel/plan/letter`，**pinned/permanent 仍可被检索命中（不过滤），命中后加 📌 前缀** → 向量补充通道（相似度 > 0.5 标 `[语义关联]`）→ 情绪重构（valence 微调 ±0.1）→ 命中时 `touch()` → 结果不足 3 条时 40% 概率随机漂浮 1~3 条低权重旧桶。**不过滤 anchor**（设计：主动检索时希望能找到坐标系桶）。
+`dispatch()` 内部四种模式（按判定顺序，仅 `breath_advanced` 能触达全部四种；`breath()`/`breath_search()` 分别固定落在模式 3 / 模式 4）：
+
+1. **Feel 通道**（`domain="feel"` 或 `tags` 含 `"feel"`/`"__feel__"`，仅 `breath_advanced`）：直接拉所有 `type==feel` 桶，按 `created` 倒序展示原文，按 `surfacing.feel_max_tokens`（默认 6000）做 token 预算；**超出预算的旧 feel 折叠为 60 字符单行摘要**，并在末尾追加 `更早的 feel 摘要（N 条，已折叠）` 段。**不排除 anchor 桶**（设计：feel 通道只看 type=feel）。
+2. **重要度批量模式**（`importance_min >= 1`，仅 `breath_advanced`）：跳过语义搜索，按 importance 降序返回 ≤20 条；过滤 `feel/plan/letter` 与 `dont_surface=True`；**不过滤 anchor、不过滤 pinned**（设计：主动按 importance 检索时希望能找到所有重要桶）。
+3. **浮现模式**（无 `query`；`breath()` 固定走这里）：钉选桶始终展示为「核心准则」+ 未解决桶按衰减分排序，**冷启动**（`activation_count==0 && importance>=8`）的桶最多 2 个插到最前；后续排序**有两条互斥路径**：当 `surfacing.sampling.enabled=true` 时走加权无放回采样（`top_k` / `sample_k` / `temperature` 控制；详见 §7.1），否则走原 Top-1 固定 + Top-2~20 随机洗牌；按 `max_results` 硬截断。**排除 anchor 桶**（设计：anchor 是坐标系，不该随机冒泡干扰日常浮现；这是浮现模式独有的过滤）。浮现**不调用** `touch()`。**末尾追加 `=== 久未浮现 ===`** 段（iter 1.6 §7 被动联想）：从 `activation_count==0 && importance>=8` 或 `importance>=9 && 距 last_active>7天` 的桶里随机抽 1~2 条，模拟「突然想起来」。
+4. **检索模式**（有 `query`；`breath_search()` 固定走这里）：每个 query 只生成一次查询向量。确定性优先级为「ID精确 > keywords/name/tags/domain 精确 > 元数据子串 > content/summary 原词 > fuzzy/BM25 > 纯语义」，保证中文短词不会被语义结果挤下去；显式检索不再混入随机漂浮。默认返回 5 个普通桶，命中的 pinned/protected/permanent 不占名额；未显示数量在末尾提示。日期过滤使用 `updated_at`（老桶回退 `created`），搜索 `touch()` 不会改变它。
 
 (实现注意：`tags="feel"` 在第一个分支被映射为 `domain="feel"` 后清出 tag_filter；其它 tag 走 AND 过滤；`max_tokens` 上限 20000，`max_results` 上限 50；`importance_min` 模式下硬上限 20 条不可调；浮现模式中钉选桶**不计入** `max_results` 上限。)
 
@@ -289,7 +298,7 @@ feel 桶自身：
 两种路径：
 
 - **Feel 模式** (`feel=True`)：跳过 LLM 分析，自动注入 `__feel__` 标签，写入 `feel/沉淀物/`。`source_bucket` 提供时把源桶标记为 `digested=True` 并写 `model_valence`。返回 `🫧feel→{id}`。
-- **普通模式**：`analyze()` → 用户传入的 `valence`/`arousal` 优先于 LLM 结果（B-09 修复）→ `_merge_or_create()`（相似度 > `merge_threshold` 合并，否则新建）→ 写 embedding → 异步触发 `_check_plan_resolution()` 扫 active plans。返回 `合并→{name}` 或 `新建→{name}`。
+- **普通模式**：`analyze()` → 用户传入的 `valence`/`arousal` 优先于 LLM 结果（B-09 修复）→ `_merge_or_create(raw_merge=True)`（相似度 > `merge_threshold` 时以分隔线追加原文，否则新建）→ 原文落盘后投递 embedding outbox → 异步触发 `_check_plan_resolution()` 扫 active plans。返回 `合并→{name}` 或 `新建→{name}`。`analyze()` 或 embedding 不可用时只降级元数据/向量索引，正文仍原样落盘；**hold 永远不调 `dehydrate()`/`merge()` 压缩正文**。
 
 (改动注意：`pinned=True` 走单独分支直接创建到 `permanent/`，importance 强制锁 10，不走合并；用户显式传 valence/arousal=0.0 也算「有效」，必须走 `0 <= v <= 1` 判定，不能用 `if valence` 否则 0.0 会被忽略——这就是 B-09。)
 
@@ -305,9 +314,10 @@ feel 桶自身：
 
 ### 3.4 `trace` — 修改/删除
 
-签名：`trace(bucket_id, name="", domain="", valence=-1, arousal=-1, importance=-1, tags="", resolved=-1, pinned=-1, digested=-1, content="", delete=False, status="", weight=-1, dont_surface=-1, why_remembered="")`
+签名：`trace(bucket_id, ..., merge="")`
 
-- `delete=True` → `bucket_mgr.delete()` + `embedding_engine.delete_embedding()`。
+- `delete=True` → `bucket_mgr.delete()`：写入 `deleted_at` 并将 Markdown 移入 `archive/`；只清理可重建的 embedding 索引，不抹除记忆文件。
+- `hard_delete=True` → 仅当桶在创建时带有 `provenance.kind=test` 与 `erasable=true` 才物理删除；真实记忆、后补字段及普通 Dashboard 路径均不得越过此边界。Dashboard 普通模式支持多选/当前筛选全选的沉底、主动遗忘和归档，开发者模式才显示测试桶永久删除入口。
 - 其它字段：仅收集传入的（用 `-1`/空串作为「未传」哨兵）批量更新 frontmatter。
 - `pinned=1` 自动锁 importance=10 + 触发 `_move_bucket(permanent_dir)`。
 - `resolved=1` **不**自动归档（B-01 修复）；只更新 frontmatter，由 decay 引擎自然衰减。
@@ -315,29 +325,30 @@ feel 桶自身：
 - `content="..."` 替换正文并重新生成 embedding。
 - `weight` 仅对 plan 桶有意义；`dont_surface` 切换主动遗忘标记；`why_remembered` 写「为什么留着这条」自由文本。
 - **不暴露 `anchor` 字段**：anchor 切换必须走 `anchor()` / `release()` 工具（受 24 上限保护）。
+- `bucket_id` 可为逗号分隔的最多 50 个 ID；先校验全部存在，再逐桶执行。批量模式拒绝 name/content/meaning/media/merge/永久删除。
+- `merge=目标ID`：仅普通动态桶可用；内容追加、标签/领域去重、importance 取大、情感取平均，源桶写入去向后归档。源/目标为 pinned/protected/permanent 或特殊类型时拒绝。
 
 (返回时会按 `resolved`/`digested` 状态变化追加人话提示，如「→ 已沉底，只在关键词触发时重新浮现」。)
 
 ### 3.5 `pulse` — 系统状态 + 桶列表
 
-签名：`pulse(include_archive=False)`
+签名：`pulse(include_archive=False, show_all=False)`
 
-返回：固化/动态/归档桶数、总 KB、衰减引擎状态、所有桶（带图标）的元数据摘要行。
-
-(已知局限：返回头部的统计行**不显示** `feel_count` / `plan_count` / `letter_count`，但底下的列表会列出这些桶——会让用户感到「数字对不上数量」。详见 §12 反逻辑点 1。)
+默认返回全部 pinned/protected/permanent + 按衰减权重排序的前 15 个普通桶；`show_all=True` 恢复全量清单。统计始终放在末尾。
 
 ### 3.6 `dream` — 做梦自省
 
-签名：`dream(window_hours=48)`（默认 48h 窗口；clamp 到 1~336h）
+签名：`dream(window_hours=48, detail_ids="", max_tokens=0)`（窗口 clamp 到 1~336h）
 
-- 默认取过去 48 小时内 `created` 或 `last_active` 任一在窗口内的桶（排除 permanent/feel/pinned/protected/plan/letter）
+- 默认取窗口内最近 5 个普通桶，只返回元数据与最长 180 字符的原文摘录
+- `detail_ids` 最多 20 个逗号分隔 ID；显式指定项返回完整正文，也可越过时间窗口
 - 排序：先按 `last_active` 倒序；候选超过 **40 个**时改按 `decay_engine.calculate_score()` 降序截断到前 40，避免一次涌进来太多撑爆上下文
-- 拼接桶摘要（完整正文，不截断）+ 自省引导 header
+- 核心准则、active plans、feel 历史默认也使用原文摘录；显式 detail 项保持全文
 - embedding 启用时附加：连接提示（最相似对，`>0.5`）+ feel 结晶提示（一条 feel 与 ≥2 条其它 feel 相似度 `>0.7` → 建议升级为 pinned）
-- 末尾追加 `=== 你的 active plans ===` 全量列表
-- 末尾追加 `=== 你的 feel 历史（全量，旧 feel 按 token 预算折叠）===`：按 `surfacing.feel_max_tokens`（默认 6000）做预算，超出的老 feel 折叠为 60 字符单行摘要
+- active plans 默认最多 20 条摘要；feel 默认最多 20 条摘要，显式 detail 项不受该条数限制
+- 每个辅助区块在整体 token 预算外会整块省略并给出提示，不截断显式请求的正文
 
-(实现细节：用户可手动传更大的 `window_hours`，但软上限 40 仍生效。plan 历史不参与 token 预算全量返回；feel 历史走 token 预算折叠。)
+(实现细节：候选阶段仍保留 40 桶软上限以供关联提示使用，但主输出只取最近 5 个；辅助区块按 `surfacing.dream_max_tokens`（默认 6000）整体预算，显式全文优先。)
 
 ### 3.7 `plan` — 登记待办
 
@@ -391,8 +402,8 @@ feel 桶自身：
 |---|---|---|---|
 | `/` | GET | 公开 | 重定向到 `/dashboard` |
 | `/health` | GET | 公开 | 健康检查（桶数 + 衰减引擎状态） |
-| `/breath-hook` | GET | 公开 | SessionStart 钩子（HTTP 模式才生效） |
-| `/dream-hook` | GET | 公开 | Dream 钩子 |
+| `/breath-hook` | GET | 🔒 cookie/token | SessionStart 钩子（HTTP 模式才生效）；默认需 Dashboard 登录态或 hook token |
+| `/dream-hook` | GET | 🔒 cookie/token | Dream 钩子；默认需 Dashboard 登录态或 hook token |
 | `/dashboard` | GET | 公开（页面），AJAX 走 cookie | Dashboard HTML |
 | `/letters` | GET | 公开 | 301 → `/#letters`（已合并进 dashboard 的「信」分页，老书签兼容） |
 | `/auth/status` | GET | 公开 | 是否已登录 / 是否需要初始化密码 |
@@ -410,7 +421,7 @@ feel 桶自身：
 | `/api/settings/sampling` | GET / POST | 🔒 | iter 1.9：dashboard 的加权采样面板。GET 返回当前 `surfacing.sampling.{enabled,top_k,sample_k,temperature}`；POST 校验范围后热更新到内存 config（不写回 yaml） |
 | `/api/anchors` | GET | 🔒 | iter 2.0：列出所有 anchor 桶（按 `created` 升序），返回 `{ok, count, limit, anchors:[...]}` |
 | `/api/bucket/{id}/anchor` | POST | 🔒 | iter 2.0：toggle anchor 标记。Body 可传 `{value: bool}` 强制设置；不传则切换。已满 24 时返回 **409** + `{error, count, limit}` |
-| `/api/bucket/{id}` | DELETE | 🔒 | 硬删除，需 `?confirm=true` |
+| `/api/bucket/{id}` | DELETE | 🔒 | 删除到档案：移入 `archive/` 并写 `deleted_at`，需 `?confirm=true`；不做物理抹除 |
 | `/api/letters` | GET | 🔒 | 信件列表，支持 `?author=user\|claude` |
 | `/api/letter` | POST | 🔒 | Dashboard 写信入口 |
 | `/api/search?q=` | GET | 🔒 | 搜索 |
@@ -425,8 +436,8 @@ feel 桶自身：
 | `/api/breath-debug?q=&valence=&arousal=` | GET | 🔒 | 评分调试（每桶四维分解） |
 | `/api/config` | GET | 🔒 | 配置查看（API key 脱敏） |
 | `/api/config` | POST | 🔒 | 热更新配置（dehydration / embedding / merge_threshold；可选持久化到 yaml） |
-| `/api/host-vault` | GET | 🔒 | 读 `OMBRE_HOST_VAULT_DIR`（process env → .env 文件 fallback） |
-| `/api/host-vault` | POST | 🔒 | 写入项目根目录的 `.env`，需重启 docker compose 生效 |
+| `/api/host-vault` | GET | 🔒 | 读 `OMBRE_HOST_VAULT_DIR`；Docker 内只报告 Compose 注入值并标记 `compose_managed` |
+| `/api/host-vault` | POST | 🔒 | 裸机可写项目 `.env`；Docker 内返回 409，避免假装容器能修改宿主机挂载 |
 | `/api/status` | GET | 🔒 | Dashboard 设置页用：版本号 + 桶数 + embedding/decay 状态 + 是否环境变量密码 |
 | `/api/import/upload` | POST | 🔒 | 上传对话历史并启动导入 |
 | `/api/import/status` | GET | 🔒 | 导入进度 |
@@ -435,8 +446,8 @@ feel 桶自身：
 | `/api/import/results` | GET | 🔒 | 已导入桶列表（含正文 300 字预览） |
 | `/api/import/review` | POST | 🔒 | 批量审阅（important / pin / noise / delete） |
 | `/api/bucket/{id}/edit` | PATCH/POST | 🔒 | iter 1.6 §6：Dashboard 编辑桶元数据（name/tags/domain/importance/resolved/pinned/digested/content）；走 §5 大小+pinned 配额 |
-| `/api/export` | GET | 🔒 | iter 1.6 §2：流式返回 zip（buckets/*.md + embeddings.db + export_meta.json）；**不包含 config / 密钥**；export_meta.json 含 embedding 模型信息，供导入端检查一致性 |
-| `/api/migrate/upload` | POST | 🔒 | 上传 zip 包，解析内容、识别 ID 冲突、检查 embedding 模型一致性；返回冲突列表，不实际写入 |
+| `/api/export` | GET | 🔒 | 返回可验证 zip：buckets/*.md + SQLite 一致性快照 + export_meta.json + backup_manifest.json；**不包含 config / 密钥**；任何源文件读取失败则整个导出失败，不产生“看似成功”的残缺包 |
+| `/api/migrate/upload` | POST | 🔒 | 上传 zip 包，先做 ZIP 安全边界与清单 SHA-256 校验，再解析内容、识别 ID 冲突、检查 embedding 模型/维度；返回冲突和 `integrity_verified`，不实际写入 |
 | `/api/migrate/status` | GET | 🔒 | 查询当前迁移任务状态（phase / 冲突列表 / 导入进度 / 重新向量化进度） |
 | `/api/migrate/apply` | POST | 🔒 | 执行导入，携带冲突决策 `{bucket_id: "skip"|"overwrite"|"keep_both"}`；异步执行，轮询 status 看进度 |
 | `/api/heartbeat` | GET | 🔒 | iter 1.6 §3：心跳（uptime / last_op_ts / decay 状态），Dashboard 右上角灯轮询 |
@@ -449,18 +460,17 @@ feel 桶自身：
 | `/api/embedding/migrate` | POST | 🔒 | 触发后端切换 + 全量重算 embeddings（异步） |
 | `/api/embedding/migrate/status` | GET | 🔒 | 重算进度（done/total） |
 | `/api/settings/human` | GET / POST | 🔒 | 系统通知称呼（`OMBRE_HUMAN_NAME`），dashboard「① 我」面板 |
-| `/api/buckets/purge` | POST | 🔒 | 危险区批量物理删除（不可恢复，仅 dashboard 进入「清理模式」后可调） |
+| `/api/buckets/purge` | POST | 🔒 | 已退役的兼容端点：固定返回 `410 physical_deletion_forbidden`，不读写任何记忆 |
 | `/api/letter/{letter_id}` | PATCH | 🔒 | 改信件元数据（read_at 等） |
 | `/api/letter/{letter_id}` | DELETE | 🔒 | 删信件（移入 archive） |
 | `/api/env-vars` | GET | 🔒 | dashboard 设置页「⑤ 环境变量」只读区：当前进程读到的所有 `OMBRE_*`，敏感字段脱敏 |
 | `/api/env-config` | GET | 🔒 | 可写 6 字段的当前值（脱敏） |
 | `/api/env-config` | POST | 🔒 | 热更新 6 字段并写回 `.env`（重启仍有效） |
-| `/mcp/*` | — | 公开 | FastMCP 主连接器（iter 2.1）：breath / hold / grow / dream / trace |
-| `/mcp-extra/*` | — | 公开 | FastMCP 副连接器（iter 2.1）：anchor / release / pulse / plan / letter_write / letter_read / **I** |
+| `/mcp/*` | — | 公开 | FastMCP 单连接器（iter 2.2）：全部 14 个工具 —— breath / breath_search / breath_advanced / hold / grow / dream / trace / anchor / release / pulse / plan / letter_write / letter_read / **I** |
 
 🔒 = 需要 cookie 认证，未认证返回 `JSON {error, setup_needed}` 状态码 401。
 
-(实现注意：所有 `/api/*` 路由在函数体首行调用 `web/_shared.py` 的会话鉴权 helper；这些路由已全部从 server.py 迁到 `web/<域>.py`，新增端点在对应模块里沿用此模式。`/mcp` 与 `/mcp-extra` 走另一套保护：`config.yaml: mcp_require_auth`（默认 true）开启时由纯 ASGI 中间件校验 MCP Bearer token；设为 false 则开放直连。MCP 协议自身无 cookie 认证层，靠传输层（cloudflared、ngrok）+ Bearer 做边界。另：`_MCPAcceptShim` 中间件会给 `/mcp*` 探测请求补齐 `Accept: application/json, text/event-stream`，修复副连接器首个探测 POST 的 406。)
+(实现注意：所有 `/api/*` 路由在函数体首行调用 `web/_shared.py` 的会话鉴权 helper；这些路由已全部从 server.py 迁到 `web/<域>.py`，新增端点在对应模块里沿用此模式。`/mcp` 走另一套保护：`config.yaml: mcp_require_auth`（默认 true）开启时由纯 ASGI 中间件（`server_app.py: MCPAuthMiddleware`）校验请求；设为 false 则完全开放直连（无任何校验）。`mcp_require_auth: true` 时还有一个正交的 `mcp_auth_mode` 三选一：默认 `"oauth"` 走 OAuth 2.1 + PKCE Bearer token（`web/oauth.py: _is_valid_mcp_token`）；`"token"` 改走静态密钥（`web/oauth.py: _is_valid_static_mcp_token`，比对 `mcp_token` / `OMBRE_MCP_TOKEN`，接受 `Authorization: Bearer` 或 `Ombre-MCP-Token` 请求头，不支持 URL 参数）。两种模式互斥——`token` 模式下 `web/oauth.py: _oauth_required_from_config()` 返回 false，OAuth 的 discovery/register/authorize/token 路由全部 404。`mcp_auth_mode`/`auth_required` 均在进程启动时读入中间件闭包，Dashboard 热改 `sh.config` 后需重启才真正切换（`/api/config` 用 `restart_required` 字段回显）；静态 Token 本身的校验函数每次请求实时读取，重新生成 Token 无需重启即可生效。MCP 协议自身无 cookie 认证层，靠传输层（cloudflared、ngrok）+ Bearer/静态 Token 做边界。另：`_MCPAcceptShim` 中间件会给 `/mcp*` 探测请求补齐 `Accept: application/json, text/event-stream`，修复某些客户端首个探测 POST 的 406。)
 
 ### 4.2 Dashboard 认证
 
@@ -481,6 +491,695 @@ feel 桶自身：
 | `dream_hook` | `/dream-hook` 命中 | `surfaced`, `chars` |
 
 `OMBRE_HOOK_SKIP=1` 全局跳过推送。
+
+### 4.3.1 Ledger Mirror（vNext Phase 1，本地镜像）
+
+`bucket_manager.create()/update()/delete()/archive()/touch()` 在 Markdown 写入成功后，会向 `<buckets_dir>/_ledger/events.jsonl` 追加一条 JSONL 事件。
+
+当前 ledger 是 **mirror / audit seed**，不是 canonical truth：现有读取、搜索、Dashboard、embedding 仍以 Markdown bucket 和现有索引为准。ledger 只记录 `schema_version=1`、`ledger_role="mirror"`、`canonical=false`、事件类型、trace id/kind、正文 `sha256` hash 与 frontmatter/payload；不会复制正文内容。
+
+损坏行或半写入行不会阻断后续 bucket 操作。`LedgerMirror.iter_events()` 会跳过损坏行，`verify_integrity()` 会报告 `invalid_lines`，`BucketManager.ledger_integrity_report()` 与 `/api/system/diagnostics` 的 `ledger` 检查会暴露该只读诊断信息。
+
+### 4.3.2 Trace Catalog Projection（vNext Phase 2，shadow）
+
+`TraceCatalogProjection` 是第一 个可从 ledger mirror 重建的 shadow projection。它只在诊断时按需从 `LedgerMirror.iter_events()` 重建，不写入持久 projection 文件，也不替换 Markdown、BM25、embedding 或 Dashboard 当前读取路径。
+
+当前 projection 记录每个 trace 的轻量目录状态：`trace_id`、`trace_kind`、`state`、`body_hash`、`resolved`、`deleted`、`touch_count`、`latest_event_type` 与 seq 信息。`ledger_integrity_report()` 会把它作为 `trace_catalog_projection` 附在 ledger 诊断里，并报告 `applied_seq/source_latest_seq/lag`。这证明 projection 可重建，但仍然是 **shadow / non-canonical**。
+
+### 4.3.2B SQLite/FTS Projection（vNext Phase 2B，persistent shadow）
+
+`projection_sqlite.TraceSQLiteProjection` 是 `TraceCatalogProjection` 的持久化 shadow adapter。它从同一份 ledger events 重建 `<buckets_dir>/_ledger/projections/trace_catalog.sqlite3`，写入 `traces` 与 `projection_meta` 表，并在 SQLite 支持 FTS5 时创建 `trace_fts`。
+
+这个 SQLite projection 仍然不是 canonical truth：
+
+- 不复制正文内容，只写 ledger 中已有的 body hash 与 payload metadata。
+- 不替换 Markdown bucket、BM25、embedding、Dashboard 当前读取路径。
+- 可以被删除后从 ledger 重新生成。
+- `ledger_integrity_report()` 会把它作为 `sqlite_projection` 暴露，并报告 `trace_count/tombstone_count/applied_seq/source_latest_seq/lag/fts_enabled`。
+
+FTS 搜索只用于本地验证和未来 projection 迁移准备，当前只索引 payload 中的 `name/tags/domain/why_remembered/summary` 等文本。真实用户查询仍走现有 search/embedding/BM25 路径，直到后续阶段明确切换。
+
+### 4.3.2C Vector Projection Manifest（vNext Phase 2C，shadow diagnostics）
+
+`projection_vector.TraceVectorProjectionManifest` 是 Phase 2 的向量侧 shadow manifest。它不会生成、重算、删除或排序 embedding，只读取 ledger events 与现有 `embeddings.db`，报告向量 projection 是否和活跃 trace 对齐。
+
+当前诊断字段包括：`expected_trace_count`、`vector_count`、`stored_vector_count`、`missing_vector_count`、`orphan_vector_count`、`malformed_vector_count`、`model_name`、`vector_dim`、`db_exists`、`applied_seq/source_latest_seq/lag`，并保留少量 id 样本用于定位漂移。
+
+边界：
+
+- 只把 `state="active"` 且非 deleted/tombstone/archived 的 trace 视为应有向量。
+- malformed vector 不算可用向量；如果它对应活跃 trace，会同时表现为 malformed 与 missing。
+- orphan vector 只表示 `embeddings.db` 中存在但当前 ledger active projection 不需要的 id，不自动删除。
+- `BucketManager.ledger_integrity_report()` 会把它作为 `vector_projection` 暴露；真实搜索仍走现有 `EmbeddingEngine` 与 `bucket_manager.search()`。
+
+### 4.3.3 Surface Policy VM（vNext Phase 3，shadow guard）
+
+`ombrebrain.policy.surfacing.SurfacePolicyVM` 是读取侧的最小 policy VM。它不拥有记忆、不写 bucket、不替换 Markdown canonical，只在候选进入主动浮现排序前做确定性判断。
+
+当前接入点：
+- 无参 `breath()` 的 core / unresolved / passive / occasional resolved 池。
+- Dashboard `/api/breath` 轻量浮现接口。
+
+当前规则：
+- `spontaneous` / `dream` 模式拒绝 `dont_surface=True`、`anchor=True`、`feel/plan/letter/self/i`、`archived`、`deleted_at`、`tombstone`。
+- `importance` 模式拒绝 `dont_surface=True` 与专用类型，但保留 anchor 可达性。
+- `search` 模式只拒绝终态（archived / deleted / tombstone），显式关键词搜索仍可找回 `dont_surface=True` 的记忆。这是主动遗忘契约：不主动冒出来，但没有被抹去。
+
+这一步仍是 **shadow guard**：用于把边界集中成可测试规则，后续 Phase 3 才会逐步把更多 retrieval 路径迁到同一 VM 前置。
+
+### 4.3.3B Dashboard Search Surface Policy（vNext Phase 3B）
+
+Dashboard `/api/search` 现在会在 `bucket_mgr.search()` 排序之后、JSON 返回之前调用 `SurfacePolicyVM.evaluate_bucket(..., mode="search")`。这一步只影响用户可见的 Dashboard 搜索结果，不改底层 `BucketManager.search()`。
+
+边界：
+
+- `dont_surface=True` 在显式搜索里仍可达，因为主动遗忘限制的是主动浮现，不是抹去。
+- `archived`、`deleted_at`、`tombstone` 终态不会从 `/api/search` 返回。
+- 排序、BM25、embedding、literal-hit 召回逻辑保持原样。
+- 内部调用者（导入去重、merge 候选、工具内部匹配）仍可以直接使用 `BucketManager.search()`，避免把用户可见 retrieval policy 混入写入/维护流程。
+
+### 4.3.3C MCP Breath Search Surface Policy（vNext Phase 3C）
+
+MCP `breath(query=...)` 现在也会在显式查询命中进入 dehydration / touch 之前调用 `SurfacePolicyVM.evaluate_bucket(..., mode="search")`。这一步覆盖关键词搜索结果和语义向量补充结果，但不改变底层 `BucketManager.search()`。
+
+边界：
+
+- `dont_surface=True` 在 `breath(query=...)` 里仍可达；主动遗忘只限制无参/被动浮现。
+- `archived`、`deleted_at`、`tombstone` 终态不会从 MCP 查询搜索返回，也不会被这条路径 `touch()`。
+- `feel`、`plan`、`letter` 仍沿用 MCP 搜索入口原有排除规则，保持专用通道边界。
+- 查询结果不足时的随机 drift 仍是后续收敛项；本阶段只统一显式 query hit 的读取侧 policy。
+
+### 4.3.4 Tombstone Erasure（vNext Phase 4，shadow）
+
+`BucketManager.delete()` 仍保留现有用户体验：Markdown 文件写入 `deleted_at` 后移入 `archive/`，普通 `get()` / `list_all(include_archive=False)` 不再返回它。Phase 4 增加的是 shadow 语义：同一份 frontmatter 还会写入 `tombstone=True`、`tombstoned_at=<deleted_at>`、`erasure_mode="tombstone_only"`。
+
+ledger 仍记录兼容事件 `TraceDeletedToArchive`，但 payload 会携带 tombstone 字段。`TraceCatalogProjection` 重建时把带 tombstone payload 的删除事件解释为 `state="tombstone"`，并在诊断报告里增加 `tombstone_count`。旧 ledger 里只有 `deleted_at`、没有 tombstone 字段的 `TraceDeletedToArchive` 仍保持 `state="deleted_to_archive"`，避免历史事件被强行改义。
+
+这一步没有改 Dashboard-only hard purge：`/api/buckets/purge` 仍是人工确认、带专用 header 的物理清理路径。vNext 的 tombstone-only 约束先覆盖 OB/LLM 的记忆语义层，后续如果要收紧人类 UI 的 purge，需要单独设计迁移和提示。
+
+### 4.3.5 Ledger Replay Validator（vNext Phase 5A，shadow）
+
+`ledger_replay.LedgerReplayValidator` 是 future Rust kernel 之前的 Python shadow contract。它不写入任何状态，只读取 ledger 事件、重建 `TraceCatalogProjection`，并返回 `replay` 诊断报告：
+
+- `ok` / `violations`：是否满足基础重放不变量。
+- `event_count` / `latest_seq`：本次重放覆盖的事件范围。
+- `projection_trace_count` / `tombstone_count` / `unknown_event_count`：重建出的 projection 摘要。
+
+当前检查的性质很小但重要：`seq` 必须严格递增，`trace_id` 不能为空，`body_hash` 必须是 `sha256:<64hex>`，projection 不能落后 source latest seq，tombstone trace 必须同时是 deleted。`BucketManager.ledger_integrity_report()` 会把这个报告作为 `replay` 字段附在 ledger 诊断里，`/api/system/diagnostics` 原样展示。
+
+这仍然不是 canonical runtime：Markdown 读写路径不变，replay validator 是“以后内核必须做到什么”的可执行契约。
+
+### 4.3.6 Ledger Property Runner（vNext Phase 5B，deterministic stress）
+
+`ledger_property.LedgerReplayPropertyRunner` 是 replay validator 的确定性随机压力层。它用 `random.Random(seed)` 生成合法 ledger 事件流，覆盖 create / update / touch / archive / tombstone-delete 生命周期，然后把每个 case 交给 `LedgerReplayValidator`。同一个 seed 必须生成完全相同的事件序列，方便复现失败。
+
+它不在 Dashboard 或常规诊断热路径里运行，只用于测试和人工本地校验。目标是给未来 Rust kernel / FFI 一套可复用 acceptance harness：Rust 版本接入后，也必须能通过同样的 replay/property cases。
+
+### 4.3.7 Rust Replay Kernel（vNext Phase 6A，scaffold）
+
+`kernel/rust/ombre-kernel` 是 Rust kernel 的第一块脚手架。它目前是独立 Cargo crate，不接入 Python runtime、不参与 Dashboard、不替换 `LedgerReplayValidator`。crate 使用 std-only，无第三方依赖，定义 `LedgerEvent`、`ReplayReport`、`ReplayFailure`、`ViolationCode` 与 `ReplayKernel`，实现和 Python shadow validator 对齐的基础 replay 检查。
+
+本机或 CI 有 Rust 工具链时可运行：
+
+```bash
+cargo test --manifest-path kernel/rust/ombre-kernel/Cargo.toml
+```
+
+当前 Windows 本地环境如果没有 `cargo`，Python 测试只校验 scaffold/API 约定。Phase 6A 的边界是“可编译的独立内核雏形”，不是 FFI；后续 Phase 6B 才考虑 Python 调用 Rust 或 CI 强制 cargo test。
+
+### 4.3.8 Policy Enforcement Mode（vNext Phase 7A，configurable）
+
+v3 `PolicyEngine` 现在区分两个结果：
+
+- `allowed`：Policy VM 的原始判断，表示契约上是否允许。
+- `effective_allowed`：当前 enforcement mode 下调用方应该是否真正放行。
+
+默认 `enforcement_mode="audit"`，因此 `audit_only=True`，即使 `allowed=False`，`effective_allowed` 也保持 True，用于延续旧的 legacy runtime 行为：记录风险，不阻断运行。显式创建 `PolicyEngine.default(enforcement_mode="enforce")` 时，`audit_only=False`，`effective_allowed` 跟随 `allowed`，给后续真正拦截 capability/plugin 调用留出稳定接口。
+
+Decision summary 继续保留 `policy_allowed` 旧字段，同时新增 `policy_effective_allowed`。这避免把“策略判断”和“当前是否阻断”混成一个概念。
+
+### 4.3.9 Executable Policy Boundary（vNext Phase 7B，opt-in enforce）
+
+`LegacyRuntime.from_config()` 现在会读取 policy enforcement 配置：
+
+- 首选：`{"policy": {"enforcement_mode": "enforce"}}`
+- 兼容入口：`{"policy_enforcement_mode": "enforce"}`
+
+默认仍是 `audit`，所以旧的 legacy 行为不变：policy 可以记录 `allowed=False`，但 `effective_allowed=True`，`LegacyExecutionPipeline` 仍会调用 handler 并记录成功/失败结果。
+
+显式 `enforce` 时，`LegacyExecutionPipeline` 在旧 preflight 之后、handler 之前评估 v3 policy。如果 `policy_verdict.effective_allowed=False`，pipeline 会：
+
+1. 不调用 legacy handler。
+2. 写入一条 `ok=False` 的 execution trace。
+3. 把 `error_type` 记为 `PolicyViolation`。
+4. 抛出 `PolicyViolation("policy denied ...")`。
+
+旧的 `ExecutionEnvelope.required_permissions` 仍是原有硬权限检查，和 v3 policy enforcement 分开。测试里刻意覆盖了“profile policy deny 但 required_permissions 为空”的路径，确保 Phase 7B 拦截的是新的 `effective_allowed`，不是旧权限机制。
+
+### 4.3.10 Plugin Capability Enforcement（vNext Phase 7C，opt-in enforce）
+
+`PluginRuntime` 现在有执行期 capability scope。插件注册期 sandbox 仍保持原规则：manifest 必须声明 capability，`write_legacy_state` 不能写 protected surfaces。Phase 7C 增加的是执行前检查：
+
+- 默认 `PluginRuntime.default()` 是 `audit`，缺权限只写入 `last_execution_decision()`，handler 仍执行。
+- 显式 `PluginRuntime.default(enforcement_mode="enforce")` 时，缺权限会在 handler 前抛 `PolicyViolation`。
+- `execute(..., permissions=(...), actor_name=..., source=...)` 会构造执行 scope，并复用 `CapabilityMicrokernel.authorize()`，不在 plugin runtime 里复制权限规则。
+
+已知 foundation capability 会检查真实权限。例如 `tools.breath` 需要 `tools:breath` 和 `memory:write`。未知的 plugin-local capability 仍按“manifest 已声明”处理，避免这一步误伤未来插件生态；等插件 capability registry 成型后，再把未知能力改成显式注册。
+
+`PluginExecutionDecision` 暴露 `allowed/effective_allowed/audit_only/missing_permissions/protected_surfaces`。这和 Phase 7B 的 legacy execution boundary 对齐：`allowed` 是原始策略判断，`effective_allowed` 是当前 enforcement mode 下是否真正放行。
+
+### 4.3.10.1 Plugin Agency Boundary（vNext Phase 11，registration-time）
+
+`PluginAgencyBoundary` 对应 vNext §20：插件可以扩展 infrastructure，但不能扩展 agency。它运行在 `PluginSandbox.evaluate()` 的最前面，早于 protected surface 检查和执行期 capability microkernel。
+
+允许的 `plugin_type` 包括 `projection`、`embedding_provider`、`vault_exporter`、`dashboard_panel`、`search_analyzer`、`migration_checker`、`decay_visualizer`、`integrity_auditor`。禁止的类型包括 `autonomous_goal`、`personality_engine`、`current_emotion_generator`、`belief_updater`、`answer_controller`、`user_scoring` 及其 `_plugin` 变体。
+
+`PluginManifest.from_dict()` 现在支持 vNext 风格 capability flags，例如：
+
+```python
+{
+    "type": "projection",
+    "capabilities": {
+        "read_surfaceable": True,
+        "issue_commands": False,
+        "set_current_emotion": False,
+    },
+}
+```
+
+布尔表里只有 true 项会进入 `manifest.capabilities`。如果插件声明 `issue_commands`、`set_current_emotion`、`create_autonomous_goal`、`belief_updater`、`answer_controller`、`user_scoring` 等 cognitive capability，注册期会返回 `PluginSandboxDecision(allowed=False, reason="forbidden cognitive capability")`，`PluginRuntime.register()` 会直接拒绝安装 handler。
+
+### 4.3.10.2 Observability Metric Boundary（vNext Phase 12，diagnostic boundary）
+
+`ombrebrain.observability.ObservabilityMetricBoundary` 对应 vNext §21：高级 observability 只能衡量 memory health，不能衡量 user value、dependency、persuasion、manipulation 或 personality compliance。
+
+允许的 metric 名称包括：
+
+- `trace_count_by_state`
+- `unresolved_trace_count`
+- `average_accessibility`
+- `decay_distribution`
+- `tombstone_count`
+- `projection_lag`
+- `ledger_replay_time`
+- `surfacing_rejection_reasons`
+- `archive_growth`
+- `compression_lineage_depth`
+
+禁止的 metric 名称包括 `user_loyalty_score`、`user_emotional_dependency_score`、`persuasion_score`、`manipulation_success_score`、`personality_compliance_score`。即使 metric 本身是允许项，只要 labels 里携带这些 user-value / manipulation 维度，也会被拒绝。未知 metric 默认拒绝，调用方必须先把它明确归入 memory-health 允许集。
+
+Phase 31 后，Dashboard `/api/system/diagnostics` 会追加 `observability_boundary` 检查项：它从已有 buckets/ledger 诊断结果构造 `trace_count_by_state`、`archive_growth`、`projection_lag`、`tombstone_count` 等 memory-health metrics，再通过 `ObservabilityMetricBoundary.evaluate_manifest()` 校验后显示。这仍是只读诊断，不导出用户价值、依赖、说服或操控类指标，也不会改变 runtime 行为。
+
+### 4.3.10.3 Crash Recovery Contract（vNext Phase 13，shadow contract）
+
+`ombrebrain.resilience.recovery.CrashRecoveryContract` 对应 vNext §22，用来验证并描述并发/崩溃恢复边界。Phase 36 后，它会作为 Dashboard `/api/system/diagnostics` 的 `crash_recovery` 检查项运行一组只读路径契约样例；它仍不改变 `LedgerMirror`、Markdown 写入、SQLite/向量 projection 或实际 fsync 行为。
+
+写路径的契约顺序是：
+
+```text
+mcp_tool_call
+policy_preflight
+append_event_to_wal
+fsync
+update_projections_async
+update_markdown_vault_projection
+return_trace_id
+```
+
+读路径的契约顺序是：
+
+```text
+query
+candidate_generation_from_shadow_indexes
+canonical_trace_verification
+policy_gate
+surfacing_budget
+context_compiler
+```
+
+`evaluate_recovery_plan()` 检查四条恢复原则：`ledger_wins`、`projections_rebuild`、`markdown_repaired`、`indexes_disposable`。如果计划把 Markdown、SQLite projection、vector index 等当成 canonical source，会返回 violation；恢复时必须是 ledger wins，projection/index 可以丢弃重建。
+
+### 4.3.10.4 Replication Contract（vNext Phase 14，shadow contract）
+
+`ombrebrain.cluster.replication.ReplicationContract` 对应 vNext §23。它不实现新的分布式共识，也不改变现有 Raft-style local cluster simulator；只验证集群/复制设计是否仍保留 OB 的记忆哲学边界。
+
+拓扑检查要求：
+
+- canonical ledger 必须是 single-writer。
+- projections 可以是 multi-reader。
+- replica 可以是 optional encrypted replica。
+- 复制模式应是 snapshot + append-only segment。
+- 如果声明 `full_distributed_consensus`，必须给出明确必要性，否则返回 `unnecessary_full_consensus`。
+
+segment 检查要求复制的是 trace / tombstone 事件，而不是 database-style `user_record`。如果某个 replica 收到 erased content removal（如 `TraceContentRemoved` / `ErasedContentRemoved`），同一复制段里必须同时带有该 trace 的 tombstone；否则返回 `content_removal_without_tombstone`。
+
+Phase 37 后，Dashboard `/api/system/diagnostics` 会追加 `replication_contract` 检查项：它运行一组只读 topology / segment 样例，把 single canonical writer、trace/tombstone replication 和非数据库化边界显示出来。这仍不启动真实集群、不读写用户 bucket，也不改变任何 GitHub sync 或 runtime 复制行为。
+
+### 4.3.10.5 Migration Preservation Contract（vNext Phase 15，shadow contract）
+
+`ombrebrain.maintenance.MigrationPreservationContract` 对应 vNext §24。它不改变现有 `adapters.migration`、`migrate_engine.py` 或 embedding migration 流程，只作为迁移前/迁移后 records 的诊断对比层。
+
+`evaluate_records()` 要求迁移不能抹平以下字段：
+
+- `trace_kind`
+- `state`
+- `lineage`
+- `decay`
+- `tombstone`
+- `anchor`
+- `surfacing_rules`
+
+如果 source 里有 dynamic / permanent / archive / anchor 等不同语义，而 target 全部变成 `trace_kind="memory"` 且 `target_table="memories"`，会返回 `philosophical_distinctions_flattened`。这对应 §24 里禁止的 `dynamic/permanent/archive/anchor → one table called memories`。
+
+`evaluate_phase_plan()` 检查迁移阶段顺序：近期 Python-first 阶段是 ledger mirror、rebuildable projections、policy VM retrieval、tombstone-only erasure；Rust kernel extraction 不能作为 vNext startup prerequisite。
+
+Phase 38 后，Dashboard `/api/system/diagnostics` 会追加 `migration_preservation` 检查项：它运行一组只读 records / phase plan 样例，把 trace kind、state、lineage、decay、tombstone、surfacing rules 和 Python-first 阶段顺序显示出来。这不会执行真实迁移、不会读取或改写用户 bucket，也不会把 Rust kernel extraction 变成启动前置条件。
+
+### 4.3.10.6 Public MCP Tool Design Contract（vNext Phase 16，diagnostic boundary）
+
+`ombrebrain.protocol.PublicToolDesignContract` 对应 vNext §25。它不改变当前 live FastMCP 注册，也不会移除现有兼容入口；它把“哪些名字可以公开给模型作为 MCP 工具”变成可测试契约，并在 Phase 32 后接入 Dashboard diagnostics 的只读源码注册审计。
+
+公开 normal tool 只能使用器官语言：`hold`、`grow`、`trace`、`breath`、`pulse`、`dream`、`anchor`、`I`、`letter`、`plan`。当前已存在的兼容名字 `release`、`letter_write`、`letter_read` 暂时允许，但报告里会给出替代归宿 `anchor` / `letter`，方便后续迁移文档和客户端慢慢收敛。
+
+工程名不能作为 public MCP tool 暴露：`remember`、`touch`、`resolve`、`suppress`、`surface`、`hippocampal_recall`、`offline_consolidate`、`update_memory_row` 等只允许作为 internal label。restricted/admin 工具（如 `verify_ledger`、`replay_ledger`、`rebuild_projection`、`admin_erasure_request`）必须显式标为 restricted 且要求 admin。
+
+这一步的边界是 diagnostic/manifest validation：它保证工具名设计不会滑回 database/API 语言，也不会让 `delete`、`dump_all`、`set_emotion`、`decide`、`update_user_profile`、`force_personality` 这类破坏 OB 哲学边界的名字进入普通工具清单。Dashboard `/api/system/diagnostics` 的 `public_tool_manifest` 检查会解析 `src/server.py` 中的 `@mcp.tool()` / `@mcp_extra.tool()` 装饰器，把公开工具名交给该 contract 校验；它不导入 `server.py`，避免启动副作用。
+
+### 4.3.10.7 Code Standards Contract（vNext Phase 17，diagnostic）
+
+`ombrebrain.architecture.HighestDifficultyCodeStandards` 对应 vNext §27。它不是外部 lint runner，也不会在本阶段执行 ruff / mypy / pyright；它是一层可测试的 architecture contract，用 `CodeArtifactSpec` 描述某个代码 artifact 或变更是否触碰高风险边界。
+
+当前检查范围：
+
+- Python adapter / dashboard / API 层不能直接修改 canonical memory，必须通过 explicit command boundary。
+- Rust/kernel artifact 必须是 append-only ledger 语义，不能绕过 Policy VM，policy denial 必须有明确 reason。
+- normal path 不能暴露 hard-delete API。
+- async task 必须声明 idempotent。
+- projection 可以滞后，但必须报告 lag。
+- dashboard action 必须 capability-scoped。
+- new memory kind、deletion/archive 行为变化、total-recall-like 功能、plugin capability expansion、affective scoring change、dream behavior change 等触碰哲学边界的变更必须带 ADR；有 ADR 的 policy 变更还应带 property / mutation test evidence。
+
+Phase 34 后，Dashboard `/api/system/diagnostics` 会追加 `code_standards` 检查项：它构造一小组已知高风险边界 artifact manifest（`src/server.py`、`src/web/system.py`、`src/web/search.py`、`src/ombrebrain/policy/surfacing.py`），交给 `HighestDifficultyCodeStandards.evaluate_manifest()` 校验。这不是 ruff/mypy/pyright，也不是全仓库扫描；它只把核心边界文件是否仍符合 vNext code-standard contract 暴露成系统诊断信号。后续如果要落到 CI 或 release checklist，可以把 real file scanner、lint runner、ADR index 和 release gate 接在这个 contract 后面。
+
+### 4.3.10.8 Advanced Command Boundary Contract（vNext Phase 18，diagnostic）
+
+`ombrebrain.domain.AdvancedCommandBoundaryContract` 对应 vNext §28。它把高级命令边界里的 `command → policy → event → ledger → receipt` 做成 receipt validator，检查某次 memory mutation 是否有完整证据链。
+
+当前 `CommandBoundaryReceipt` 可表达：
+
+- `command` 是否进入边界；
+- `policy_preflight` 是否执行且允许；
+- mutation 是否派生出 explicit events；
+- `event_policy_validation` 是否发生在 `ledger_append` 之前；
+- derived events 是否 append 到 ledger；
+- 是否存在 adapter direct write marker。
+
+对于 `hold` / `grow` / `trace` / `decay` / `import` / `migrate` / `anchor` / `plan` / `letter_write` / `request_admin_erasure` 等 mutating command，contract 要求 events 和 ledger append 同时存在；`breath` 这类 read-only command 可以没有 events / ledger append。policy preflight 被拒绝后仍 append ledger，会返回 `ledger_append_after_policy_denial`；adapter 自己绕过 command boundary 改 memory，会返回 `adapter_direct_memory_write`。
+
+这一步仍是 diagnostic：它没有替换 `LegacyExecutionPipeline`，也没有要求现有所有 handler 立刻产出 receipt。后续可以把 runtime 的 decision record、policy verdict、ledger append result 汇总成 `CommandBoundaryReceipt`，再让 diagnostics 或 release gate 调用本 contract。
+
+### 4.3.10.9 Surface Context Compiler（vNext Phase 19，contract-only）
+
+`ombrebrain.retrieval.SurfaceContextCompiler` 对应 vNext §29。它位于 retrieval/context serialization 之间：输入是已经由 surface policy 产出的 `SurfaceDecision`（或同形 mapping），以及对应 memory payload；输出复用 `MemoryContextBundle` / `MemoryContextItem`。
+
+当前行为：
+
+- 只接收 `allowed=True` 的 surface decision。
+- 被 policy deny 的 decision 不会进入 context。
+- 按 `max_items` 做预算截断，`truncated=True` 表示还有 allowed memory 没进入 context。
+- decision 的 `reasons` 会变成 `why_surfaced`。
+- 缺失 memory payload 的 allowed decision 会被跳过，不会凭空生成上下文。
+- 最终 item 仍由 `MemoryContextCompiler` 生成，所以 `instructional_force="none"`、`may_control_reasoning=False`、imperative wording redaction 等边界保持一致。
+
+这一步仍未接入 live `breath()` / `/api/search` 输出，只是把“allowed surface decisions → bounded non-instructional context”这段未来编译器做成可测试对象。后续如果要接入真实读取路径，应在 policy gate 之后、最终文本拼装之前调用它。
+
+Phase 39 后，Dashboard `/api/system/diagnostics` 会追加 `surface_context` 检查项：它运行一组只读 allowed decision / memory payload 样例，确认旧记忆进入 context 后仍保持 `instructional_force="none"`、`may_control_reasoning=False`，并对 imperative wording 做 redaction。这不会接入 live `breath()` 或 `/api/search`，也不会读取真实 bucket。
+
+Phase 44 后，`LegacyRuntime` 会直接暴露 `compile_surface_context(decisions, memories, max_items=..., excerpt_chars=...)`。它调用 `SurfaceContextCompiler` 编译真实 surface decision / memory payload，并同时返回 `FormalInvariantChecker.evaluate_context_items()` 的报告。`VNextPreflightReportBuilder.surface_context` 复用这个 runtime API。这一步仍不改变 `breath()` / `/api/search` 的用户可见文本，但后续 live read path 可以通过 runtime 生成 non-instructional context，而不是绕开到 shadow compiler。
+
+### 4.3.10.10 ADR Requirements Contract（vNext Phase 20，diagnostic）
+
+`ombrebrain.architecture.ADRRequirementsContract` 对应 vNext §30。它把“哪些变更必须写 ADR”和“ADR 必须回答哪些边界问题”拆成两个可测试入口：
+
+- `evaluate_change(ADRChangeSpec)`：检查 new memory kind、deletion/archive 行为变化、total-recall-like 功能、plugin capability expansion、affective scoring change、dream behavior change、`I` tool change、影响 current behavior/personality 的功能等主题是否带 ADR。
+- `evaluate_document(ADRDocument)` / `evaluate_documents(...)`：检查 ADR 标题是否形如 `# ADR-XXXX: Title`，并检查 template 里的 8 个必答章节是否存在。
+
+必答章节为：
+
+- `Decision`
+- `Why this is not cognition`
+- `Why this is not a database feature`
+- `How forgetting still works`
+- `How tombstones are preserved`
+- `How present thinking remains with the LLM`
+- `Rejected alternatives`
+- `Tests required`
+
+Phase 33 后，Dashboard `/api/system/diagnostics` 会追加 `adr_requirements` 检查项：它只读扫描 `docs/adr/ADR-*.md`，把文档内容交给 `ADRRequirementsContract.evaluate_documents()` 校验。没有 ADR 目录或没有 ADR 文档时只显示 warning；已存在 ADR 文档但缺少标题/必答章节时显示 error。它仍不阻断 release，也不改写文档；后续如果要接入 PR gate 或 release checklist，应复用同一个 contract。
+
+### 4.3.10.11 Red Lines Contract（vNext Phase 21，diagnostic）
+
+`ombrebrain.policy.RedLineContract` 对应 vNext §31。它把 17 条“绝不能 merge”的能力红线编成稳定 code，并允许用 code-shaped claim 或 phrase-shaped claim 检查候选 feature。
+
+当前 red line codes：
+
+- `normal_hard_delete_without_tombstone`
+- `total_recall_ordinary_api`
+- `current_emotion_from_stored_affect`
+- `memory_derived_behavior_commands`
+- `user_profile_scoring`
+- `autonomous_goal_creation`
+- `personality_enforcement_engine`
+- `silent_compression_no_loss_claim`
+- `plugin_policy_vm_bypass`
+- `similarity_as_surfacing_permission`
+- `breath_replaced_by_top_k_search`
+- `pulse_emits_current_emotion`
+- `dream_creates_autonomous_goals_or_decisions`
+- `trace_overwrites_original_memory`
+- `anchor_unlimited_permanent_pinning`
+- `self_description_personality_enforcement`
+- `brain_language_implies_human_consciousness`
+
+`evaluate_feature(RedLineFeatureSpec)` 和 `evaluate_manifest(...)` 只做诊断，不扫描 PR，也不阻断 merge。Phase 35 后，Dashboard `/api/system/diagnostics` 会追加 `red_lines` 检查项：它把当前 diagnostics 暴露的几个 feature claims（系统诊断、ledger 诊断、公开工具 manifest、code standards、ADR requirements）交给 `RedLineContract.evaluate_manifest()`，确认这些功能描述没有踩到 17 条 vNext 红线。后续如果要接到 ADR/release checklist、GitHub Action 或 Dashboard 管理端 release preflight，应继续复用同一个 contract。
+
+### 4.3.10.12 vNext Preflight Report（Phase 22，local aggregate）
+
+`ombrebrain.maintenance.VNextPreflightReportBuilder` 把 Phase 16-21 的 shadow/contract 层聚合成一个本地 JSON-safe preflight：
+
+- `public_tools`：公开 MCP 工具命名契约。
+- `ledger_mirror`：append-only JSONL mirror 的 schema、hash、sequence 与 mirror/non-canonical 角色样例。
+- `trace_catalog_projection`：从 ledger mirror 重建内存 trace catalog shadow projection。
+- `sqlite_projection`：从 ledger mirror 重建 SQLite/FTS shadow projection 并验证检索样例。
+- `vector_projection`：读取 embeddings SQLite 的 shadow manifest，验证缺失/孤儿/坏向量统计路径。
+- `ledger_replay`：用 replay validator 验证 ledger sequence、body hash 和 projection lag。
+- `formal_invariants`：无静默抹除、projection 不改写真相、普通工具不能 total recall 等哲学不变量样例。
+- `context_serialization`：浮现记忆进入上下文前必须去指令化，并通过 formal invariant 检查。
+- `tool_output_humility`：公开工具输出必须保持 memory-humble，不成为命令、当前情绪或信念引擎。
+- `retrieval_scoring`：高相似度不能绕过 policy gate；排序使用 surface score，而不是裸 candidate score。
+- `code_standards`：高难度代码标准契约。
+- `command_boundary`：`command → policy → event → ledger → receipt` 证据链契约。
+- `runtime_command_boundary`：扫描最近 runtime fabric 事件里的真实 `command_boundary` receipt。
+- `observability_boundary`：只允许 memory health 指标，拒绝用户价值/操控类指标。
+- `crash_recovery`：写路径、读路径与恢复计划遵循 ledger-wins。
+- `replication_contract`：复制拓扑保持单 canonical writer、trace/tombstone 语义和非数据库化边界。
+- `migration_preservation`：迁移必须保留 trace kind、state、lineage、decay、tombstone 与 Python-first 阶段顺序。
+- `surface_context`：allowed surface decision 到 non-instructional context 的编译契约。
+- `adr_requirements`：ADR 标题与必答章节契约。
+- `red_lines`：17 条不能 merge 的能力红线。
+- `vnext_coverage`：列出本地 Phase 计划、测试文件与 preflight 覆盖映射，给出完成率和覆盖率。
+
+`V3MaintenanceReportBuilder.build()` 现在会附带 `vnext_preflight`，并把它计入顶层 `ok`。这一步仍不改变 Dashboard 路由，不自动扫描 PR，也不阻断 release；它只是把 vNext 架构边界从一堆分散测试收束成一个可以被 CLI、诊断页或 CI 后续调用的报告对象。
+
+Phase 41 后，Dashboard `/api/system/diagnostics` 会追加 `preflight_report_self` 检查项：它复用已经生成的 `vnext_preflight` 报告，提取其中的 `checks.preflight_report_self`，单独展示必需 check 是否齐全、是否有 malformed check。这不会重复执行 preflight，也不会让 self-check 变成 release gate。
+
+### 4.3.10.13 vNext Preflight CLI and Diagnostics（Phase 23）
+
+`tools/vnext_preflight.py` 现在可以直接生成本地 vNext preflight JSON：
+
+```powershell
+python tools/vnext_preflight.py --buckets-dir buckets
+python tools/vnext_preflight.py --buckets-dir buckets --output preflight.json
+python tools/vnext_preflight.py --buckets-dir buckets --coverage-only
+```
+
+Dashboard 系统诊断的 `build_system_diagnostics()` 也会追加一个 `vnext_preflight` 检查项。它使用当前 `buckets_dir` 创建 `LegacyRuntime`，调用 `VNextPreflightReportBuilder`，并把完整报告放在 check `details` 里。
+
+这一步仍不是 release gate：CLI 返回码会反映 preflight 是否通过，但不会自动提交、推送、阻断 GitHub Release 或改变任何 memory runtime 行为。诊断页里如果 preflight 自身运行失败，会降级成 warning，避免设置页因为诊断检查而打不开。
+
+Phase 40 后，Dashboard `/api/system/diagnostics` 会追加 `preflight_cli_diagnostics` 检查项：它只读扫描 `tools/vnext_preflight.py` 和 `src/web/system.py`，确认 `--buckets-dir`、`--output`、`--coverage-only`、`VNextPreflightReportBuilder` 调用以及 Dashboard hook 仍存在。这不会执行 CLI，也不会创建 preflight 输出文件。
+
+### 4.3.10.14 Runtime Command Boundary Evidence（Phase 24）
+
+`LegacyRuntime.record_execution_event()` 与 `record_tool_event()` 写入的事件会携带 `command_boundary.receipt` 和 `command_boundary.report`。`VNextPreflightReportBuilder` 的 `runtime_command_boundary` 会读取最近 fabric 事件，重新评估这些 receipt：
+
+- 有效 receipt：计入 `receipt_count`，并在 `reports` 中保留 contract 结果。
+- 旧事件只有 `command_plan`、没有 `command_boundary`：计入 `missing_receipts`，check 状态为 `warning`，但不让顶层 `ok=false`，避免老桶升级后被历史诊断事件卡住。
+- receipt 本身非法、缺失 receipt、或生成 metadata 时报错：计入 `issues`，check 状态为 `error`，并让 vNext preflight 返回失败。
+
+这仍是只读诊断：不会修复旧事件、不会改写 WAL、不会自动阻断 release。它的意义是把 Phase 18 的 command boundary 从“样例合同”推进到“真实运行证据”。
+
+Phase 43 后，`LegacyRuntime` 会直接暴露 `debug_command_boundary_health(limit=50)`。它扫描最近真实 fabric events，统计 candidate event、receipt、missing receipt、invalid receipt 和 issues；`VNextPreflightReportBuilder.runtime_command_boundary` 复用同一个 runtime API，而不是维护一份独立扫描逻辑。这仍不是 enforcement gate，但它把 command-boundary evidence 从 preflight 私有实现推进成 runtime 可查询能力。
+
+### 4.3.10.15 vNext Preflight Coverage Expansion（Phase 25）
+
+`VNextPreflightReportBuilder` 现在不只覆盖 Phase 16-24，也会纳入更早的重型 shadow contracts：formal invariants、context serialization、tool output humility、retrieval scoring、observability boundary、crash recovery、replication contract 与 migration preservation。
+
+这些 check 使用明确的安全样例，不扫描真实用户 bucket 内容，也不改变 runtime 行为。它们的作用是把分散在单元测试里的 vNext 架构边界收束到一个本地 preflight 出口中，方便 CLI、系统诊断页、后续 release checklist 或 CI 读取。
+
+### 4.3.10.16 vNext Coverage Matrix（Phase 26）
+
+`ombrebrain.maintenance.vnext_coverage.VNextCoverageMatrix` 是一个只读、本地的 Phase 映射表。它把目前的 vNext 本地实施阶段映射到：
+
+- 对应的 `docs/superpowers/plans/*.md` 计划文件；
+- 覆盖该阶段的测试文件；
+- 如果已经接入 preflight，则列出对应的 check name；
+- `local_completion_percent` 与 `preflight_coverage_percent`。
+
+`VNextPreflightReportBuilder` 会把它作为 `checks.vnext_coverage` 输出。这个 check 的 `ok=True` 表示“矩阵生成成功”，不等于架构已经最终完成；它只是把本地进度变成机器可读信息，方便回答“现在完成了多少”和“哪些阶段还没有 preflight 样例覆盖”。
+
+CLI 也支持 `tools/vnext_preflight.py --coverage-only`，只输出 `vnext-coverage.v1` 矩阵，适合在终端里快速查看完成率而不展开完整 preflight JSON。
+
+矩阵里的 `preflight_gaps` / `next_preflight_targets` 表示“已经有本地实现和测试，但还没有接入 preflight 样例检查”的阶段，不表示这些阶段失败。它们用于决定下一批应该补哪些 aggregate check。
+
+Phase 42 后，Dashboard `/api/system/diagnostics` 会追加 `vnext_coverage` 检查项：它复用已经生成的 `vnext_preflight` 报告，提取其中的 `checks.vnext_coverage`，单独展示 phase count、completion percent、preflight gap count 和 next targets。这不会重新计算矩阵，也不会把覆盖率数字解释成最终发布承诺。
+
+### 4.3.10.17 Early Core Preflight Samples（Phase 28）
+
+`VNextPreflightReportBuilder` 现在为早期核心阶段补了样例级 preflight 覆盖：
+
+- Phase 1：`ledger_mirror`
+- Phase 2A：`trace_catalog_projection`
+- Phase 2B：`sqlite_projection`
+- Phase 2C：`vector_projection`
+- Phase 5A：`ledger_replay`
+
+这些 check 会在临时目录里构造一小段安全样例 ledger 和 shadow projection，不读取真实 bucket 内容、不写用户 vault、不改 runtime 状态。它们的作用是把早期核心机制纳入 aggregate report，让 `vnext_coverage.next_preflight_targets` 能继续向后推进。
+
+### 4.3.10.18 Mid Core Preflight Samples（Phase 29）
+
+`VNextPreflightReportBuilder` 继续为中段高风险契约补样例级 preflight 覆盖：
+
+- Phase 5B：`ledger_property`
+- Phase 6A：`rust_kernel_scaffold`
+- Phase 7A：`policy_verdicts`
+- Phase 7C：`plugin_capability_enforcement`
+- Phase 22：`preflight_report_self`
+
+这些 check 仍然只使用固定 seed、内存样例或只读文件检查。`ledger_property` 用小样本确定性回放压力测试，`rust_kernel_scaffold` 只确认 Rust kernel scaffold 文件和导出的 replay contract 类型，不要求生产环境安装 Rust toolchain；`policy_verdicts` 和 `plugin_capability_enforcement` 验证 audit/enforce 两种 verdict 的语义边界；`preflight_report_self` 验证 aggregate report 自身没有漏掉必需 check。
+
+### 4.3.10.19 Preflight Gap Closure（Phase 30）
+
+`vnext_coverage.preflight_gaps` 现在可以在本地实施矩阵内清零。最后两项补充覆盖是：
+
+- Phase 23：`preflight_cli_diagnostics`，只读确认 `tools/vnext_preflight.py` 的 CLI 参数和 Dashboard diagnostics hook 仍然存在；
+- Phase 25：`preflight_coverage_expansion`，确认 Phase 8-15 相关 sample-driven checks 已经进入 aggregate preflight 且当前通过。
+
+这一步不把 preflight 变成 release gate，也不从 preflight 内部递归执行 CLI。CLI / diagnostics 的真实执行路径仍由 `tests/test_v3_maintenance_report.py` 和 `tests/test_system_diagnostics.py` 覆盖；aggregate preflight 只负责在本地报告里暴露“入口未丢失、覆盖语义完整”的结构化信号。
+
+### 4.3.10.20 Diagnostics Observability Boundary（Phase 31）
+
+`web.system.build_system_diagnostics()` 现在会把 Dashboard 已经读取到的 buckets/ledger 诊断转换成一组 memory-health metric manifest，并追加 `observability_boundary` check。当前 live 指标只来自已有只读诊断数据：
+
+- `trace_count_by_state`
+- `archive_growth`
+- `projection_lag`
+- `tombstone_count`
+
+这个检查的目的不是增加新的监控维度，而是防止 diagnostics 后续迭代时悄悄混入 user-value、dependency、persuasion、manipulation 或 personality compliance 这类被 vNext 禁止的观测指标。它不联网、不扫描 bucket 内容、不写入 vault；如果 boundary 拒绝某个指标，系统诊断会把该项标成 error 并保留 contract report。
+
+### 4.3.10.21 Public Tool Manifest Diagnostics（Phase 32）
+
+`web.system.build_system_diagnostics()` 现在会追加 `public_tool_manifest` check。它通过 AST 解析 `src/server.py`，收集 `@mcp.tool()` 和 `@mcp_extra.tool()` 装饰的公开 MCP 工具函数名，然后用 `PublicToolDesignContract.evaluate_manifest()` 校验这些名字仍然符合器官语言边界。
+
+这一步刻意不 import `server.py`，因为 server 模块带有 FastMCP 实例和启动副作用；源码审计足以覆盖当前公开注册点。如果后续 FastMCP 注册方式迁移到独立 manifest，可以把这个 diagnostics check 的输入从 AST 换成真实 manifest，但仍应先经过 `PublicToolDesignContract` 再显示或发布。
+
+### 4.3.10.22 ADR Requirements Diagnostics（Phase 33）
+
+`web.system.build_system_diagnostics()` 现在会追加 `adr_requirements` check。它扫描 `docs/adr/ADR-*.md`，读取为 `ADRDocument` 后交给 `ADRRequirementsContract.evaluate_documents()`，检查每篇 ADR 是否有合法标题和 8 个边界必答章节。
+
+真实仓库里没有 ADR 文档时，该项是 warning 而不是 error；这表示“还没有 ADR 证据”，不表示运行时故障。只有已经存在的 ADR 文档不合格时才会变成 error，方便在系统诊断中提前发现高风险架构变更缺少哲学边界说明。
+
+### 4.3.10.23 Code Standards Diagnostics（Phase 34）
+
+`web.system.build_system_diagnostics()` 现在会追加 `code_standards` check。它不会运行外部 lint，也不会读取全部源码，而是根据固定的高风险边界文件列表构造 `CodeArtifactSpec`：
+
+- `src/server.py`
+- `src/web/system.py`
+- `src/web/search.py`
+- `src/ombrebrain/policy/surfacing.py`
+
+这些 artifacts 会通过 `HighestDifficultyCodeStandards` 校验 typed boundary、explicit command boundary、dashboard capability scope、policy-rule 测试证据等 vNext 工程红线。没有找到这些文件时显示 warning；发现 contract issue 时显示 error。
+
+### 4.3.10.24 Red Lines Diagnostics（Phase 35）
+
+`web.system.build_system_diagnostics()` 现在会追加 `red_lines` check。它根据已经构造出的诊断项生成一组安全 feature claims：
+
+- `system_diagnostics`
+- `ledger_diagnostics`
+- `public_tool_manifest`
+- `code_standards`
+- `adr_requirements`
+
+这些 claims 通过 `RedLineContract.evaluate_manifest()` 校验。该检查不会扫描 PR，不会阻断 merge，也不会把 red-line contract 变成 release gate；它只是防止 diagnostics 自身或后续诊断功能描述不小心滑入 total recall、用户画像评分、人格执行器、相似度即浮现许可等 vNext 明确禁止的能力。
+
+### 4.3.10.25 Crash Recovery Diagnostics（Phase 36）
+
+`web.system.build_system_diagnostics()` 现在会追加 `crash_recovery` check。它通过 `CrashRecoveryContract` 校验三类样例：
+
+- write path：`mcp_tool_call → policy_preflight → append_event_to_wal → fsync → update_projections_async → update_markdown_vault_projection → return_trace_id`
+- read path：`query → candidate_generation_from_shadow_indexes → canonical_trace_verification → policy_gate → surfacing_budget → context_compiler`
+- recovery plan：ledger wins, projections rebuild, markdown repaired, indexes disposable
+
+这一步不执行真实 fsync、不修复 ledger、不重建 projection，也不改变 runtime 恢复策略；它只是把 vNext 的 crash-recovery 顺序约束暴露到 Dashboard diagnostics。
+
+### 4.3.10.26 Replication Contract Diagnostics（Phase 37）
+
+`web.system.build_system_diagnostics()` 现在会追加 `replication_contract` check。它通过 `ReplicationContract` 校验两类样例：
+
+- topology：single canonical writer, multi-reader projections, optional encrypted replica, snapshot append-only segment
+- segment：trace created + tombstone-preserving archive event
+
+这一步不启动真实 cluster、不复制用户数据、不连接网络，也不把 replication contract 变成 release gate；它只是把 vNext 的复制边界暴露到 Dashboard diagnostics，方便本地 preflight 和系统页面共同观察。
+
+### 4.3.10.27 Migration Preservation Diagnostics（Phase 38）
+
+`web.system.build_system_diagnostics()` 现在会追加 `migration_preservation` check。它通过 `MigrationPreservationContract` 校验两类样例：
+
+- records：dynamic trace 与 tombstone trace 在 source/target 之间保留 trace kind、state、lineage、decay、tombstone 和 surfacing rules
+- phase plan：ledger mirror、rebuildable projections、policy VM retrieval、tombstone-only erasure 这些 Python-first 阶段已完成，startup prerequisite 不依赖 Rust extraction
+
+这一步不调用真实 migration adapter、不迁移 embedding、不写 vault，也不把 migration contract 变成 release gate；它只是把 vNext 的迁移保真边界暴露到 Dashboard diagnostics，和 preflight 报告保持同一套契约语义。
+
+### 4.3.10.28 Surface Context Diagnostics（Phase 39）
+
+`web.system.build_system_diagnostics()` 现在会追加 `surface_context` check。它通过 `SurfaceContextCompiler` 校验一条 allowed surface decision 和一条 diagnostic memory payload：
+
+- 只编译 `allowed=True` 的 surface decision
+- 输出 `surface-context.v1`
+- context item 仍然是 non-instructional：`instructional_force="none"`、`may_control_reasoning=False`
+- 旧记忆里的 imperative wording 会被 redaction，而不是变成对当前 LLM 的命令
+
+这一步不调用真实 retrieval、不读取用户记忆、不改写搜索结果，也不把 surface context compiler 变成 runtime gate；它只是把 vNext 的“浮现以后仍不能替代思考”边界暴露到 Dashboard diagnostics。
+
+### 4.3.10.29 Preflight CLI Diagnostics（Phase 40）
+
+`web.system.build_system_diagnostics()` 现在会追加 `preflight_cli_diagnostics` check。它做的是源码级完整性检查：
+
+- `tools/vnext_preflight.py` 存在
+- CLI 保留 `build_parser()`、`--buckets-dir`、`--output`、`--coverage-only`
+- CLI 仍通过 `LegacyRuntime.from_config()` 和 `VNextPreflightReportBuilder(runtime).build()` 生成报告
+- `src/web/system.py` 仍保留 `vnext_preflight` Dashboard hook 和本地排查提示
+
+这一步不运行 CLI、不写 JSON 输出、不读取真实 bucket，也不把 preflight 变成自动 release gate；它只是让 Dashboard diagnostics 能在 aggregate `vnext_preflight` 之外，单独提示 CLI/诊断入口是否被误删。
+
+### 4.3.10.30 Preflight Report Self Diagnostics（Phase 41）
+
+`web.system.build_system_diagnostics()` 现在会追加 `preflight_report_self` check。它不重新构造 preflight，而是从同一次 `VNextPreflightReportBuilder(runtime).build()` 结果里提取 `checks.preflight_report_self`，并单独展示：
+
+- `schema`
+- `required_check_count`
+- `present_required_count`
+- `missing_required_checks`
+- `malformed_checks`
+- 顶层 `vnext_preflight` 的 schema / check count
+
+这一步不重复运行 CLI、不额外读取 bucket、不写输出文件，也不改变 `vnext_preflight` 顶层 OK 语义；它只是让 Dashboard diagnostics 能直接看到 aggregate report 自身是否完整。
+
+### 4.3.10.31 vNext Coverage Diagnostics（Phase 42）
+
+`web.system.build_system_diagnostics()` 现在会追加 `vnext_coverage` check。它不重新运行 coverage matrix，而是从同一次 `VNextPreflightReportBuilder(runtime).build()` 结果里提取 `checks.vnext_coverage`，并单独展示：
+
+- `schema`
+- `phase_count`
+- `local_completion_percent`
+- `preflight_coverage_percent`
+- `preflight_gap_count`
+- `next_preflight_targets`
+- 顶层 `vnext_preflight` 的 schema / check count
+
+这一步不扫描真实 bucket、不写输出文件、不改变 `vnext_preflight` 顶层 OK 语义；它只是让 Dashboard diagnostics 能直接回答“本地 vNext 阶段覆盖到了哪里”，并把 gap/next-target 信号从 aggregate report 里拿出来。
+
+### 4.3.11 Formal Invariants Shadow Checker（vNext Phase 8A / Phase 10，diagnostic）
+
+`ombrebrain.policy.formal_invariants.FormalInvariantChecker` 把 vNext §18/§19 的哲学不变量转成可执行 shadow checks。它不写 bucket、不改 projection、不阻断请求；当前只作为 diagnostics/report contract 使用。
+
+当前覆盖的不变量：
+
+- Invariant 1：物理擦除必须有 tombstone 事件，不能静默抹去。
+- Invariant 2：shadow projection rebuild 不能创造或丢失 canonical trace existence。
+- Invariant 3：相似度或检索结果不能绕过 surfacing policy，尤其不能让 `dont_surface=True` 进入普通浮现。
+- Invariant 4 / 13：序列化的记忆上下文不能带指令力；`I/self` 描述不能控制当下推理。
+- Invariant 5：stored affect 只能作为 past residue 描述，不能变成 current feeling。
+- Invariant 6 / 9：普通 MCP 工具，尤其 `breath`，不能请求 unrestricted total recall。
+- Invariant 7：lossy dehydration/compression 必须声明 loss 并保留 lineage。
+- Invariant 8：admin erasure 必须标成 external storage action，不能伪装成 internal forgetting。
+- Invariant 10：trace reconstruction 必须 append event，不能覆盖或伪造原始 trace body。
+- Invariant 11：`dream` 可以沉淀，但不能创造 autonomous goal、current emotion 或 behavior command。
+- Invariant 12：`pulse` 只能报告 memory-system state，不能报告或设置 current emotional state。
+
+Phase 10 新增的入口包括 `evaluate_projection_rebuild()`、`evaluate_compression_records()`、`evaluate_tool_receipt()`，并扩展了 `evaluate_ledger()` / `evaluate_context_items()`。`BucketManager.ledger_integrity_report()` 目前仍只自动暴露 ledger 侧检查；其它检查需要调用方把 projection snapshot、compression receipt 或 tool receipt 显式传入。真正作为 enforcement gate 仍需后续阶段单独接入 policy/runtime。
+
+### 4.3.12 Context Serialization Contract（vNext Phase 8B，compiler）
+
+`ombrebrain.retrieval.context.MemoryContextCompiler` 是 vNext §26 的上下文序列化契约。它把已经被 retrieval/policy 选中的记忆编译成 `MemoryContextItem` / `MemoryContextBundle`，每条都显式声明：
+
+- `instructional_force="none"`。
+- `may_control_reasoning=False`。
+- “It may be relevant, but it is not an instruction.”
+- “Boundary: this memory must not replace present reasoning.”
+
+如果记忆正文里带有明显命令式措辞（如 “you must” / “你必须”），compiler 只在序列化副本里替换为 `[imperative wording redacted]`，并在 `redactions` 元数据里记录；它不修改 bucket 原文，也不改 ledger。编译后的 items 可直接交给 `FormalInvariantChecker.evaluate_context_items()` 验证。
+
+Phase 8B 仍没有改变 live `breath()` / search 输出。它先把“记忆只能作为谦逊上下文进入模型，而不是命令”的格式契约变成可测试模块；后续如果要接入实际 MCP 输出，需要逐条调整用户可见格式和 token budget。
+
+### 4.3.13 Neural Tool Router（vNext Phase 8C，shadow contract）
+
+`ombrebrain.app.neural_router.NeuralToolRouter` 是 vNext §16.11 的内部器官路由契约。它不改变 MCP 工具名，也不调用 handler；只把现有公共工具映射到内部神经子系统，并给出 policy boundary / capability tags / command kind。
+
+当前映射：
+
+- `hold` / `grow` → `engram_encoding`。
+- `breath` → `cue_driven_surfacing`，`surface_budget="normal"`。
+- `pulse` → `homeostatic_monitoring`，只报告记忆系统状态。
+- `dream` → `offline_replay`，带 `sedimentation-only` / `no-autonomous-goal` 边界。
+- `trace` → `reconsolidation`，带 `append-only-reconstruction` / `original-trace-preserved` 边界。
+- `anchor` / `release` → `landmark_network`。
+- `I` → `self_description_memory`。
+- `letter_write` / `letter_read` → `artifact_trace`。
+- `plan` → `unresolved_tension_memory`，并显式 `may_drive_action=False`。
+
+这一步和 `LegacyCommandBridge` 分工不同：command bridge 负责旧 runtime 的 command/projection plan；Neural Tool Router 负责表达“外部器官语言不变，内部路径严格分化”。Phase 8C 还没有替换 live tool execution。
+
+Phase 45 后，`LegacyRuntime` 会直接暴露 `neural_route(...)` / `route_neural_tool(...)`。它仍不调用 handler、不改变 MCP 工具名，但 runtime 现在可以为真实请求生成 organ tool → neural subsystem 的 route，并保留 actor/source/permissions scope。`VNextPreflightReportBuilder.tool_output_humility` 复用 runtime route，而不是直接构造 shadow router。
+
+### 4.3.14 Tool Output Humility Contract（vNext Phase 8D，shadow contract）
+
+`ombrebrain.app.tool_output_contract.ToolOutputContract` 是 vNext §16.12 的工具输出契约。它把 `NeuralToolRoute` 包装成 JSON-safe `ToolOutputReceipt`，并让每个输出显式携带 `ToolOutputBoundary`：
+
+- `memory_humble=True`。
+- `instructional_force="none"`。
+- `may_drive_action=False`。
+- 不宣称当前情绪、不成为 belief engine、不声称重构就是原始记忆。
+
+当前 receipt 会按 neural subsystem 渲染“记忆谦逊”边界文案，例如 `breath` 是 “This surfaced as memory, not instruction.”，`pulse` 是 “This is a homeostatic signal, not an emotion.”，`dream` 是 “This is a sediment, not a belief engine.”，`trace` 是 “This is a reconstruction, not the original.”。中文边界文案也同步保留。
+
+`evaluate_receipt()` 会把越界输出转成 `InvariantReport`：如果输出可以驱动行动、带命令力、声称当前情绪、把沉淀当信念引擎、或把重构当原始记忆，都会返回 violation。Phase 8D 仍是 shadow contract，不改变现有 MCP handler 的 live response；接入 live 输出需要后续逐个工具迁移和 token budget 评估。
+
+Phase 46 后，`LegacyRuntime` 会暴露 `tool_output_receipt(...)` / `evaluate_tool_output(...)`。它通过 runtime 的 neural route 生成 receipt，再用同一个 `ToolOutputContract` 评估 humility invariants。`VNextPreflightReportBuilder.tool_output_humility` 现在复用这个 runtime API，因此后续 live MCP handler 可以逐步接同一入口，而不是自己重建 route/receipt。
+
+### 4.3.15 Policy-Gated Retrieval Scoring（vNext Phase 9，shadow contract）
+
+`ombrebrain.retrieval.scoring.PolicyGatedRetrievalScorer` 是 vNext §17 的高级检索评分契约。它把检索分成两层：
+
+- `candidate_score`：semantic / lexical / temporal / affective / unresolved / promise / graph-neighbor signals 的加权和。
+- `surface_score`：`candidate_score * accessibility * dignity_gate * scarcity_gate * intent_gate * non_cognition_gate`。
+
+`SurfacePolicyVM` 的拒绝会强制把 `accessibility` 归零，所以高语义相似度、高 lexical 命中或高 graph 分都不能绕过 `dont_surface`、archive、tombstone、deleted 等 surface policy。`rank()` 也按最终 `surface_score` 排序，而不是按 raw candidate score 排序。
+
+Phase 9 仍是 shadow scoring contract：它没有替换 `tools/breath/search.py`、`tools/breath/surface.py` 或 Dashboard `/api/search` 的实际排序逻辑。后续接 live retrieval 时，应先把现有 decay/search/vector 分数映射到 `RetrievalFeatures`，再逐步打开 ranking，而不是直接重排所有用户可见结果。
+
+Phase 47 后，`LegacyRuntime` 会暴露 `score_retrieval_bucket(...)` / `rank_retrieval_candidates(...)`，并持有同一个 `PolicyGatedRetrievalScorer`。`VNextPreflightReportBuilder.retrieval_scoring` 复用 runtime scorer，证明 retrieval policy gate、surface score 与排名 contract 已经有 runtime 入口。真实 `breath` / search 仍需单独迁移 feature 映射与排序开关。
 
 ### 4.4 Dashboard 页面（侘寂风）
 
@@ -617,7 +1316,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 3. 多维加权精排（topic / emotion / time / importance / touch [+ semantic] [+ bm25]）—— BM25 稀疏召回作为 Dim 7（`bm25_index.py`，软依赖未装则该维度 0 分）
 4. 截断到 `limit`
 
-(改动注意：iter 2.1+ 起 embedding 不再用作候选预筛。历史实现把候选集替换成「在 embeddings.db 里的桶」，导致缺失向量的桶在 breath 检索里整体消失，pulse 总数与 breath 命中数对不上。修复后没向量的桶 `semantic_score=0`，仍可凭 topic/emotion/time/importance 命中。索引一致性由 `bucket_manager.create()/update(content=...)` 自动 `_sync_embedding()` 维持；pulse 也会附带「索引漂移」告警。)
+(改动注意：iter 2.1+ 起 embedding 不再用作候选预筛。历史实现把候选集替换成「在 embeddings.db 里的桶」，导致缺失向量的桶在 breath 检索里整体消失，pulse 总数与 breath 命中数对不上。修复后没向量的桶 `semantic_score=0`，仍可凭 topic/emotion/time/importance 命中。现在 Markdown 是唯一写入真源；`bucket_manager.create()/update(content=...)` 落盘后把 id 与正文 hash 投递到 `.embedding_outbox.json`，后台单 worker 负责生成、失败重试和启动对账。`pulse` 会把“排队中”与真正的索引漂移分开显示。)
 
 ---
 
@@ -626,7 +1325,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | 类型 (`type`) | 目录 | importance | 衰减分 | 普通 breath 浮现 | 参与合并 | 参与 dream | 自动归档 |
 |---|---|---|---|---|---|---|---|
 | `dynamic` | `dynamic/{domain}/` | 1~10 | 公式计算 | ✅ | ✅ | ✅ | ✅ |
-| `permanent`（含 `pinned`） | `permanent/{domain}/` | 锁 10 | 999 | 作为「核心准则」始终展示 | ❌ | ❌ | ❌ |
+| `permanent`（可独立于 `pinned`） | `permanent/{domain}/` | 显式 permanent 为 1~10；pinned 锁 10 | 999 | 作为固化记忆展示 | ❌ | ❌ | ❌ |
 | `feel` | `feel/沉淀物/` | 5 | 50 | ❌（仅 `domain="feel"`） | ❌ | 仅参与结晶检测 | ❌ |
 | `plan` | `plans/active/` | 7 | 50 | ❌（仅 dream 末尾 active 段） | ❌ | dream 列出 | ❌ |
 | `letter` | `letters/history/` | 10 | 50 | ❌（仅 `/breath-hook` 末尾各最新一封） | ❌ | ❌ | ❌ |
@@ -634,7 +1333,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 
 **新建时初始字段**：`activation_count = 0`（B-04 修复值；曾经是 1 导致冷启动检测失效）；`resolved/pinned/digested` 不显式写入，仅在变更时才出现在 frontmatter 中。
 
-**permanent 与 pinned 的配额关系**：`_count_pinned()` 同时数 `pinned=True` 与 `type=="permanent"` 两类，二者合并受 `limits.max_pinned`（默认 20）约束。手工把文件才进 `permanent/{domain}/` 目录的老桶也计入。`feel` / `plan` / `letter` 均不占该配额。
+**permanent 与 pinned 的配额关系**：配额唯一真相是 `metadata.pinned=True`。`type=="permanent"` 是独立的固化类型，不会仅因目录或 type 占用 `limits.max_pinned`（默认 20）；只有真正 pinned 的桶占配额并锁定 importance=10。`feel` / `plan` / `letter` 同样不占该配额。
 
 (实现注意：`pinned` 和 `protected` 在代码里几乎等价处理，但 `protected` 是历史遗留字段，新桶不应再写；UI 只暴露 pinned。)
 
@@ -672,17 +1371,21 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `scoring_weights.time_proximity` | `1.5` | time 权重（B-06 修复值） |
 | `scoring_weights.importance` | `1.0` | importance 权重 |
 | `scoring_weights.content_weight` | `1.0` | 正文权重（B-07 修复值） |
+| `hooks.token` | `""` | `/breath-hook`、`/dream-hook` 的共享 token；也可用 `OMBRE_HOOK_TOKEN` |
+| `hooks.allow_public` | `false` | 是否允许 hook 无鉴权访问；也可用 `OMBRE_HOOK_ALLOW_PUBLIC=true`，仅建议在外层已有鉴权时开启 |
 | `limits.max_bucket_bytes` | `51200` (50KB) | 单桶内容字节上限（iter 1.6 §5）；0 禁用 |
-| `limits.max_pinned` | `20` | pinned 桶数量上限（iter 1.6 §5）；permanent 桶同计；0 禁用 |
+| `limits.max_pinned` | `20` | `metadata.pinned=True` 桶数量上限；显式 permanent 不占；0 禁用 |
+| `limits.max_mcp_request_bytes` | `4194304` | `/mcp` 请求体上限；0 禁用 |
+| `limits.max_management_request_bytes` | `4194304` | Dashboard/OAuth 普通写请求上限；导入上传使用独立上限；0 禁用 |
 | `bucket_type_defaults.{type}.{field}` | （空） | iter 1.9：按桶类型覆盖 importance/valence/arousal 默认值。例：`bucket_type_defaults.feel.importance: 5`。`bucket_manager.create()` 在不传入该字段时查此表 |
 | `surfacing.breath_max_tokens` | `10000` | 覆盖 `breath` 默认 max_tokens |
-| `surfacing.breath_max_results` | `20` | 覆盖 `breath` 默认 max_results |
+| `surfacing.breath_max_results` | `5` | 普通桶默认上限；核心命中不占名额 |
 | `surfacing.feel_max_tokens` | `6000` | Feel 通道 与 dream feel 历史段的 token 预算，超出折叠为 60 字摘要 |
 | `surfacing.sampling.enabled` | `false` | 浮现模式加权采样总开关；false 走原 Top-1 + shuffle |
 | `surfacing.sampling.top_k` | `5` | 候选池大小（按衰减分取前 k） |
 | `surfacing.sampling.sample_k` | `2` | 从池里无放回抽 k 条返回 |
 | `surfacing.sampling.temperature` | `0.7` | 权重 = score^(1/temperature)；>1 更均匀，<1 更偏向高分桶 |
-| `wikilink.*` | （已废弃） | wikilink 自动注入已禁用，由 LLM prompt 直接生成 `[[]]` |
+| `wikilink.*` | （已废弃） | wikilink 自动注入已禁用，由 LLM prompt 直接生成 `[[]]`；`config.example.yaml` 不再给出可配置项 |
 
 ### 7.2 环境变量
 
@@ -702,7 +1405,9 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `OMBRE_HOOK_URL` | — | Webhook 推送地址；空则不推送 |
 | `OMBRE_HOOK_SKIP` | `false` | `1`/`true`/`yes` 跳过推送 |
 | `OMBRE_DASHBOARD_PASSWORD` | — | 预设 Dashboard 密码（覆盖文件密码，UI 改密码功能禁用） |
-| `OMBRE_HOST_VAULT_DIR` | — | docker-compose 用：宿主机 vault 路径，写入项目根 `.env` 后 `docker compose down/up` 生效 |
+| `OMBRE_HOST_VAULT_DIR` | `./buckets` | docker-compose 用：宿主机持久目录；源码版写 `deploy/.env`，独立用户版写 compose 同目录 `.env`，挂载到 `/app/buckets` |
+| `TUNNEL_EDGE` | 双 global region | Compose 默认 `region1.v2.argotunnel.com:7844,region2.v2.argotunnel.com:7844`，绕过不支持 SRV 的 VPN DNS；显式留空恢复原生 edge discovery |
+| `TUNNEL_TRANSPORT_PROTOCOL` | `http2`（Compose） | Tunnel 到 edge 的传输协议；特殊 VPN 默认 TCP/HTTP2，设 `auto` 恢复 cloudflared 自动选择 |
 
 优先级：**环境变量 > config.yaml > 内置默认值**。读取入口都在 `utils.load_config()`（`OMBRE_EMBED_BACKEND` 例外，直接在 `embedding_engine.py` 读取）。新增 env 变量必须在那里注入到 config dict。
 
@@ -746,7 +1451,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `2` | `breath` 浮现 | 冷启动桶数上限 |
 | `8` | 冷启动 | importance >= 8 才进入冷启动 |
 | `20` | `breath` 浮现 | top-1 固定 + top-2~20 随机 |
-| `0.5` | `breath` 检索 | 向量补充通道相似度下限 |
+| `0.65` | `breath` 检索 | 纯语义候选进入结果池的余弦相似度下限 |
 | `0.2` | `breath` 检索 | 情感重构系数 `(q_v - 0.5) × 0.2`，最大 ±0.1 |
 | `3` / `0.4` / `2.0` / `1~3` | `breath` 检索 | 随机漂浮触发条件 / 概率 / 池阈值 / 数量 |
 | `30` 字符 | `grow` | 短内容快速路径阈值 |
@@ -778,24 +1483,25 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `breath` 浮现 | 桶目录空 | 返回「权重池平静，没有需要处理的记忆。」 |
 | `breath` 浮现 | `list_all` 异常 | 返回「记忆系统暂时无法访问。」 |
 | `breath` 检索 | `search` 异常 | 返回「检索过程出错，请稍后重试。」 |
-| `breath` 检索 | embedding 不可用 | WARNING 日志，跳过向量通道，仅 keyword |
+| `breath` 检索 | embedding 不可用 / 查询失败 | 明确附加「检索降级」提示，跳过向量通道，继续 rapidfuzz + BM25 |
+| `breath` 检索展示 | embedding 不可用 | 明确附加「检索降级」提示，使用关键词/BM25；命中正文仍逐字完整返回 |
 | `breath` 检索 | 结果 < 3 | 40% 概率随机漂浮 1~3 条低权重旧桶 |
-| `hold` `analyze` 失败 | API 异常 | **直接 RuntimeError**，不创建桶，返回「API key 未配置或调用失败，打标无法完成，桶未创建。请检查 OMBRE_COMPRESS_API_KEY。」 |
+| `hold` `analyze` 失败 | API 异常 | 正文逐字落盘，元数据使用本地中性默认值并明确提示；绝不压缩正文 |
 | `hold` 合并搜索失败 | search 异常 | 直接走新建路径 |
 | `hold` 合并融合失败 | merge 异常 | 直接走新建路径 |
-| `hold` embedding | API 异常 / 未配置 | 桶仍创建成功，返回值追加「向量化失败，该桶不参与语义检索，仅支持关键词匹配。请检查 OMBRE_EMBED_API_KEY。」 |
+| `hold` embedding | API 异常 / 未配置 | 桶先创建成功，任务留在耐久 outbox；后台恢复后自动补齐 |
 | `grow` digest 失败 | API 异常 | **直接 RuntimeError**，不创建任何桶，返回「API key 未配置或调用失败，日记拆分无法完成，桶未创建。请检查 OMBRE_COMPRESS_API_KEY。」 |
 | `grow` 单条失败 | 单 item 异常 | 标 `⚠️条目名`，其它继续 |
 | `grow` 短内容 (<30 字) | — | 跳过 digest 走 hold 单条 |
 | `trace` 桶不存在 | get None | 返回「未找到记忆桶: {id}」 |
 | `trace` 无字段变更 | — | 返回「没有任何字段需要修改。」 |
-| `dehydrator.dehydrate` API 不可用 | `api_available=False` | **直接 RuntimeError，不静默降级** |
+| `dehydrator.dehydrate` API 不可用 | `api_available=False` | 不影响 breath；正文返回阶段不再调用 dehydrator |
 | `embedding.search_similar` 未启用 | enabled=False | 返回 `[]`，调用方 fallback |
 | `_check_plan_resolution` 无 embedding | — | 整体跳过（保守，不误报） |
 | `decay_cycle` list_all 失败 | 异常 | 返回 `{checked:0, error:str}`，不终止后台循环 |
 | `decay_cycle` 单桶评分失败 | 异常 | WARNING 日志，跳过该桶 |
 
-**核心设计决策（不要轻改）**：脱水/打标 API 不可用时**直接报错**而非本地降级。理由：本地关键词提取的语义质量不足以替代 LLM 打标，静默降级会产生错误分类的记忆，比直接报错更危险。
+**核心设计决策（不要轻改）**：派生服务不能决定 Markdown 原文是否存在。`hold` 打标失败时使用明确标注的中性元数据保留原文；`breath` 只让检索/排序决定“想起哪段”，正文返回阶段逐字使用 Markdown 当前 content；需要 LLM 做结构化拆分的 `grow` 长内容仍可显式报错。所有检索降级都必须对调用方可见，不能伪装成完整语义结果。
 
 ---
 
@@ -835,7 +1541,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | 检索结果排序看着不对 | `bucket_manager.py` | `search()` Layer 2 + `_calc_topic_score / _calc_emotion_score / _calc_time_score` |
 | 关键词明明在桶名里却没命中 | `bucket_manager.py` | `_calc_topic_score`（rapidfuzz partial_ratio 阈值）+ `fuzzy_threshold` 配置 |
 | resolved 桶完全搜不到 | `bucket_manager.py` | `search()` 阈值检查应该用 normalized 原始值，× 0.3 只在通过阈值后；旧版 B-01 行为 |
-| 向量搜索没生效 | `embedding_engine.py` | `enabled` 是否为 True；`search_similar` 是否抛异常被 server.py 捕获 |
+| 向量搜索没生效 | `embedding_engine.py` + `tools/breath/search.py` | `enabled` 是否为 True；`search_similar_strict` 是否触发降级提示；用 `tools/evaluate_retrieval.py --with-embedding` 对比基线 |
 | 向量后端切换不生效 | `web/config_api.py` | `/api/config` POST 中 embedding.backend 分支必须 `EmbeddingEngine(config)` 完整重建 |
 | `breath(domain="feel")` 返回空但有 feel 桶 | `bucket_manager.py` | `list_all()` `dirs` 列表必须含 `self.feel_dir` |
 | Top-1 永远是同一个桶 | `tools/breath/` | 浮现分支 `top1` 固定逻辑；想加多样性需改成 sampling |
@@ -869,12 +1575,13 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 |---|---|---|
 | Dashboard 401 | `web/_shared.py` + `web/auth.py` | 会话鉴权 helper；检查 cookie `ombre_session`；`OMBRE_DASHBOARD_PASSWORD` 是否正确 |
 | 改密码报「环境变量密码」错误 | `web/auth.py` | `auth_change_password` 检测 `OMBRE_DASHBOARD_PASSWORD` 设置时禁用 |
-| HTTP 模式下 Claude.ai 连不上 | `server.py` | `__main__` CORS 中间件；`_app = mcp.streamable_http_app()` + `mcp_extra` 合并；URL 末尾必须 `/mcp`（主）或 `/mcp-extra`（副） |
-| docker compose 重启后桶丢失 | — | volume 必须挂载到 `OMBRE_BUCKETS_DIR`（默认 `/data` 或 `/app/buckets`） |
-| Dashboard 改 host vault 不生效 | `web/config_api.py` | `_write_env_var`；写入 `.env` 后必须 `docker compose down/up` 重新挂载 |
+| HTTP 模式下 Claude.ai 连不上 | `server.py` | `__main__` CORS 中间件；`_app = mcp.streamable_http_app()`（单连接器，工具已回灌进 `mcp`）；URL 末尾必须 `/mcp` |
+| docker compose 重启后桶丢失 | — | 使用 `OMBRE_HOST_VAULT_DIR` 将宿主机目录 bind mount 到 `/app/buckets`；该目录同时持久化桶、配置和 Tunnel token |
+| Dashboard 改 host vault 不生效 | `web/import_api.py` | 容器无法修改启动前确定的宿主机挂载；Docker 内界面只读，必须编辑宿主机 compose 同目录 `.env` 后 `--force-recreate` |
 | keepalive 失败 | `server.py` | `_keepalive_loop`；检查 `OMBRE_PORT` 实际监听端口 |
 | Webhook 不推送 | `server.py` | `_fire_webhook`；检查 `OMBRE_HOOK_URL` 和 `OMBRE_HOOK_SKIP` |
 | 配置热更新 dehydrator 没生效 | `web/config_api.py` | `api_config_update` 中 dehydrator 字段直接赋值 + 重建 `AsyncOpenAI` 客户端 |
+| 同版本重建镜像仍运行旧代码 | `entrypoint.sh` + `ombrebrain/maintenance/code_fingerprint.py` | 播种同时比较 `VERSION` 与镜像代码指纹；查看 `code-state` 日志，不直接以任意 `_app/VERSION` 判断活动代码 |
 
 ### 11.5 import / 历史导入类
 
@@ -888,25 +1595,25 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 
 ## 12. 已知用户向反逻辑点
 
-> 这些点不是 bug，但用户/Claude 用起来会困惑。修复需要权衡，先记录。
+> 这些点是用户/Claude 用起来容易困惑的地方；已闭合的项保留为设计说明，未闭合项继续跟踪。
 
-1. **`pulse` 顶部统计行不显示 plan/letter/feel 数**。底下列表会列出这些桶，导致「数字对不上数量」。改动点：`server.py:pulse` 拼字符串处增加 `feel_count / plan_count / letter_count` 字段（`bucket_mgr.get_stats()` 已经返回，缺的只是显示）。
+1. **`pulse` 顶部统计行已显示 plan/letter/feel 数**。现在头部直接列出 `feel 桶` / `plan 桶` / `letter 桶`，不再出现「底下有桶但顶部数字对不上」。
 
-2. **README 与代码降级行为已对齐**（iter 2.0 doc-fix 闭合）。README 第三步与「常见问题」均改口为「无 key 时 hold/grow 仍能保存桶（自动兜底为「未分类」域，无打标、无向量），但 breath 浮现/检索阶段一旦触发脱水就会报错」。原冲突源自旧版 README 措辞「没有 API key 也能跑，只是脱水压缩功能不可用」与代码 `dehydrator.dehydrate()` 在 `api_available=False` 时直接 `RuntimeError` 的实情不符；现以代码实情为准。
+2. **README 与代码降级行为已对齐**。无 key 时 hold/grow 仍能保存桶（自动兜底为「未分类」域，无打标、无向量）；breath 的语义检索会明确降级为关键词/BM25，但命中桶的正文直接逐字读取 Markdown content，不依赖 `dehydrator.dehydrate()`。
 
 3. **`breath(domain="feel")` 文档说支持，但很多用户没意识到 `tags="feel"` 等价**。两条路径在 server.py:`breath` 顶部统一映射，已加在工具 docstring 里，但 dashboard 没暴露 feel 通道入口。
 
-4. **`grow` 短内容 < 30 字被静默走 hold 路径**，没有任何提示。用户传一句日记发现没被拆分会困惑。修复方向：返回串前加「（短内容，已直接保存为单桶）」标注。
+4. **`grow` 短内容 < 30 字走 hold 路径时已明确提示**。返回串会先说明「短内容已按 hold 路径保存为单条记忆，没有拆分」。
 
 5. **dream feel 历史折叠已实现**。iter 2.0 后 dream 末尾的 feel 历史段按 `surfacing.feel_max_tokens`（默认 6000）做 token 预算，超出的老 feel 折叠为 60 字符单行摘要。原记录「dream 全量返回 feel 历史不限数量」问题已闭合。
 
-6. **`OMBRE_HOST_VAULT_DIR` 写入 .env 后无任何「需要重启」提示**。Dashboard 仅在 POST 响应里写了 note，但用户如果只看 UI 状态可能不会看到那段 JSON。修复方向：UI 上加 toast 提示。
+6. **`OMBRE_HOST_VAULT_DIR` 的 Docker 挂载改由宿主机 Compose 明确管理**。容器内 Dashboard 只读并给出 `.env` + `--force-recreate` 指令，避免把容器内 `src/.env` 的假保存误认为挂载已改变。
 
-7. **wikilink 配置项已废弃但仍在 `config.example.yaml`**。新用户会以为配 `wikilink.auto_top_k` 等参数有用，实际全被忽略。修复方向：从 example 删除整个 `wikilink:` 段，或注释掉并标 deprecated。
+7. **wikilink 配置项已废弃并从 `config.example.yaml` 移除 active stanza**。example 只保留 deprecated 说明，旧配置残留仍会被忽略。
 
-8. **`trace(resolved=1)` 与 `/api/bucket/{id}/resolve` 行为一致但提示不同**。CLI 端有「→ 已沉底，只在关键词触发时重新浮现」人话说明，REST 端只返回 `{ok: true}`。Dashboard 应自行渲染同样的提示。
+8. **`trace(resolved=1)` 与 `/api/bucket/{id}/resolve` 提示已统一**。两边共用 `resolved_hint()`，REST 返回 `message`，Dashboard 直接展示。
 
-9. **`/api/bucket/{id}` DELETE 需要 `?confirm=true`，但 archive POST 不需要**。同样是「移除一个桶」，DELETE 是硬删（不可逆）archive 是软删（可在文件系统手动恢复），semantics 没问题但用户容易混淆。Dashboard UI 应明确区分两个按钮。
+9. **Dashboard 只提供「主动遗忘」「归档」和「删除到档案」**。单桶 DELETE 会移入 `archive/` 并写 `deleted_at`；物理删除 UI 已移除，旧 `/api/buckets/purge` 仅返回 410。
 
 10. **冷启动检测最多 2 个**。`importance >= 8` 的新桶超过 2 个时，第 3 个开始按普通衰减分排队，可能被压在 top-20 后随机洗牌。如果用户一次性钉选 5 条核心准则后又新建 3 个 importance=10 的事件桶，会感到「我刚建的核心事件没浮现」。
 
@@ -933,3 +1640,11 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 ---
 
 *本文档基于代码直接推导，每条断言都可对照源文件函数名验证。代码更新时请同步修订。*
+
+## 14. 安全部署模式与首次向导
+
+- `src/deployment_profile.py` 是纯领域层：定义三种模式、生成最小配置补丁、校验公网安全不变量，并生成“已保存 / 实际生效 / 环境来源”报告。
+- `src/web/onboarding.py` 独立注册 `/onboarding`、`/api/onboarding/profile`、`/api/onboarding/preflight`、`/api/onboarding/apply`。API 复用 Dashboard 会话；保存采用同目录临时文件、`fsync` 和原子替换。
+- `frontend/onboarding.html` 只消费后端模式目录，不复制安全规则；Dashboard 的 MCP 设置和首次运行提示都链接到该页面。
+- `src/web/system.py` 将同一份有效配置报告纳入系统体检。环境变量存在会被记录为来源，只有它与已保存值不同才属于覆盖告警。
+- `config.yaml` 仍是唯一持久配置真源。环境变量保留启动覆盖能力，OAuth 与 transport 的变更保存后需重启，向导不伪装成热切换。

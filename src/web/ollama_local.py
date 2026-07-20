@@ -30,7 +30,9 @@ import platform
 import asyncio
 import subprocess
 import zipfile
+import stat
 import threading
+import urllib.parse
 import urllib.request
 
 import httpx
@@ -200,17 +202,52 @@ def _bin_url(mirror: str, osk: str, arch: str) -> str:
     return f"{base}/{name}"
 
 
-def _extract_zst(path: str, dest: str) -> bool:
-    """解 .tar.zst 到 dest。优先系统 tar（--zstd / unzstd），回退 python zstandard。成功 True。"""
-    for cmd in (
-        ["tar", "--zstd", "-xf", path, "-C", dest],
-        ["tar", "--use-compress-program=unzstd", "-xf", path, "-C", dest],
-    ):
-        try:
-            if subprocess.run(cmd, capture_output=True, timeout=600).returncode == 0:
-                return True
-        except Exception:
+def _safe_archive_target(dest: str, member_name: str) -> str:
+    if not member_name or os.path.isabs(member_name):
+        raise ValueError(f"unsafe archive member path: {member_name!r}")
+    base = os.path.realpath(dest)
+    target = os.path.realpath(os.path.join(base, member_name))
+    if os.path.commonpath([base, target]) != base:
+        raise ValueError(f"archive member escapes target dir: {member_name!r}")
+    return target
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, dest: str) -> None:
+    os.makedirs(dest, exist_ok=True)
+    for info in zf.infolist():
+        target = _safe_archive_target(dest, info.filename)
+        mode = (info.external_attr >> 16) & 0o170000
+        if mode in (stat.S_IFLNK, stat.S_IFSOCK, stat.S_IFIFO, stat.S_IFCHR, stat.S_IFBLK):
+            raise ValueError(f"unsafe archive member type: {info.filename!r}")
+        if info.is_dir():
+            os.makedirs(target, exist_ok=True)
             continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+
+def _safe_extract_tar(tf, dest: str) -> None:
+    os.makedirs(dest, exist_ok=True)
+    for member in tf:
+        target = _safe_archive_target(dest, member.name)
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+            raise ValueError(f"unsafe archive member type: {member.name!r}")
+        if member.isdir():
+            os.makedirs(target, exist_ok=True)
+            continue
+        if not member.isfile():
+            raise ValueError(f"unsupported archive member type: {member.name!r}")
+        src = tf.extractfile(member)
+        if src is None:
+            raise ValueError(f"could not read archive member: {member.name!r}")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+
+def _extract_zst(path: str, dest: str) -> bool:
+    """解 .tar.zst 到 dest。逐成员校验路径和类型后再写入。成功 True。"""
     try:
         import io as _io
         import tarfile as _tf
@@ -218,16 +255,53 @@ def _extract_zst(path: str, dest: str) -> bool:
         with open(path, "rb") as f:
             with zstandard.ZstdDecompressor().stream_reader(f) as reader:
                 with _tf.open(fileobj=_io.BufferedReader(reader), mode="r|") as t:
-                    t.extractall(dest)
+                    _safe_extract_tar(t, dest)
         return True
     except Exception:
         return False
 
 
+# 运行时下载的是**可执行安装器**（Win 直接静默运行、Linux/mac 解出二进制），
+# 所以下载源必须严格约束。默认只信官方 ollama 与 GitHub Releases 的分发域。
+# 自定义 mirror（如 GFW 下的 GitHub 代理）确有正当需求 —— 但必须由部署者显式
+# 开 OMBRE_ALLOW_UNTRUSTED_MIRROR=1 主动承担风险，绝不默认放行任意主机。
+_TRUSTED_DOWNLOAD_HOSTS = (
+    "ollama.com",
+    "github.com",
+    "githubusercontent.com",   # objects.githubusercontent.com：GitHub Release 资产实际落点
+)
+
+
+def _host_is_trusted(host: str) -> bool:
+    host = (host or "").lower().split(":", 1)[0].strip(".")
+    return any(host == h or host.endswith("." + h) for h in _TRUSTED_DOWNLOAD_HOSTS)
+
+
+def _allow_untrusted_mirror() -> bool:
+    return os.environ.get("OMBRE_ALLOW_UNTRUSTED_MIRROR", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _validate_download_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("download URL must be http(s)")
+    if not _host_is_trusted(parsed.hostname or ""):
+        if not _allow_untrusted_mirror():
+            raise ValueError(
+                f"下载主机不在可信白名单：{parsed.hostname!r}。"
+                f"只信任 {', '.join(_TRUSTED_DOWNLOAD_HOSTS)}；"
+                f"如确需自定义镜像，请在部署环境设置 OMBRE_ALLOW_UNTRUSTED_MIRROR=1 后重试。"
+            )
+        logger.warning(f"[ollama-install] 使用非白名单下载主机（已由 OMBRE_ALLOW_UNTRUSTED_MIRROR 放行）：{parsed.hostname}")
+    return url
+
+
 def _download(url: str, dest: str) -> None:
     """流式下载，进度写 _install_state['percent']。"""
-    req = urllib.request.Request(url, headers={"User-Agent": "OmbreBrain-Setup"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    safe_url = _validate_download_url(url)
+    req = urllib.request.Request(safe_url, headers={"User-Agent": "OmbreBrain-Setup"})
+    # URL scheme is validated above; urllib is used for streaming installer downloads.
+    with urllib.request.urlopen(req, timeout=60) as resp:  # nosec B310
         total = int(resp.headers.get("Content-Length") or 0)
         done = 0
         with open(dest, "wb") as f:
@@ -240,6 +314,32 @@ def _download(url: str, dest: str) -> None:
                 if total > 0:
                     _install_state["percent"] = round(done / total * 100, 1)
     _install_state["percent"] = 100.0
+
+
+# 各系统安装产物的「魔数」（文件头），执行/解压前用来确认下到的是真东西，
+# 而不是镜像返回的 200 HTML 错误页或半截文件（那些被直接运行/解压很危险）。
+_ARTIFACT_MAGICS = {
+    "windows": (b"MZ",),                    # PE 可执行（安装器）
+    "macos": (b"PK\x03\x04", b"PK\x05\x06"),  # zip
+    "linux": (b"\x28\xB5\x2F\xFD",),         # zstd（.tar.zst）
+}
+_ARTIFACT_MIN_BYTES = 100 * 1024            # <100KB 基本可判定是错误页/截断
+
+
+def _verify_downloaded_artifact(path: str, osk: str) -> None:
+    """执行/解压前校验下载产物：大小合理 + 文件头匹配。不符抛异常，中止安装。"""
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise RuntimeError(f"下载文件不可读：{e}")
+    if size < _ARTIFACT_MIN_BYTES:
+        raise RuntimeError(f"下载文件过小（{size} 字节），疑似错误页或未下全，已中止")
+    magics = _ARTIFACT_MAGICS.get(osk, ())
+    if magics:
+        with open(path, "rb") as f:
+            head = f.read(8)
+        if not any(head.startswith(m) for m in magics):
+            raise RuntimeError("下载文件的格式不对（文件头不匹配预期），疑似被劫持/损坏，已中止")
 
 
 def _install_run(osk: str, arch: str, mirror: str) -> None:
@@ -255,6 +355,7 @@ def _install_run(osk: str, arch: str, mirror: str) -> None:
         if osk == "windows":
             exe = os.path.join(tmpdir, "OllamaSetup.exe")
             _download(url, exe)
+            _verify_downloaded_artifact(exe, osk)   # 执行前先确认是真的安装器
             _install_state.update(phase="installing", msg="静默安装中（per-user，无需管理员）…")
             # Ollama 的 Windows 安装器（Inno Setup）默认就装到 %LOCALAPPDATA%\Programs\Ollama，
             # per-user、不需管理员。静默装即可；不传 /CURRENTUSER 以免个别版本不允许覆盖而报错。
@@ -268,29 +369,31 @@ def _install_run(osk: str, arch: str, mirror: str) -> None:
         elif osk == "linux":
             tzst = os.path.join(tmpdir, "ollama.tar.zst")
             _download(url, tzst)
+            _verify_downloaded_artifact(tzst, osk)   # 解压前先确认是真的 zstd 包
             _install_state.update(phase="extracting", msg="解压到用户目录（无需 sudo）…")
             root = _user_install_root()
             os.makedirs(root, exist_ok=True)
             if not _extract_zst(tzst, root):  # 解出 bin/ollama + lib/
                 raise RuntimeError(
-                    "解压 .tar.zst 失败（系统缺 zstd/tar 支持）。"
+                    "解压 .tar.zst 失败（缺少 Python zstandard 支持或安装包异常）。"
                     "可改用官方脚本：curl -fsSL https://ollama.com/install.sh | sh"
                 )
             binp = os.path.join(root, "bin", "ollama")
             if os.path.isfile(binp):
-                os.chmod(binp, 0o755)
+                os.chmod(binp, 0o755)  # nosec B103
 
         elif osk == "macos":
             zp = os.path.join(tmpdir, "Ollama-darwin.zip")
             _download(url, zp)
+            _verify_downloaded_artifact(zp, osk)   # 解压前先确认是真的 zip
             _install_state.update(phase="extracting", msg="解压 App 到用户目录…")
             root = _user_install_root()
             os.makedirs(root, exist_ok=True)
             with zipfile.ZipFile(zp) as z:
-                z.extractall(root)
+                _safe_extract_zip(z, root)
             binp = os.path.join(root, "Ollama.app", "Contents", "Resources", "ollama")
             if os.path.isfile(binp):
-                os.chmod(binp, 0o755)
+                os.chmod(binp, 0o755)  # nosec B103
         else:
             raise RuntimeError(f"不支持的系统：{osk}")
 
@@ -449,6 +552,12 @@ def register(mcp) -> None:
             body = await request.json()
         except Exception:
             body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"ok": False, "error": "JSON body must be an object"}, status_code=400)
+        if "mirror" in body and not isinstance(body["mirror"], str):
+            return JSONResponse({"ok": False, "error": "mirror must be a string"}, status_code=400)
+        if len(str(body.get("mirror") or "")) > 2048:
+            return JSONResponse({"ok": False, "error": "mirror is too large"}, status_code=400)
         mirror = (str(body.get("mirror") or "official")).strip()
         osk, arch = _os_key(), _arch()
         _install_state = {"running": True, "phase": "starting", "percent": 0.0,
