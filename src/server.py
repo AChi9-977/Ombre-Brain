@@ -878,7 +878,7 @@ async def archive_session(
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
 async def wakeup() -> str:
     """☀️ 一键开机——单次调用返回记忆系统全景：钉选桶摘要、最近对话归档、未完结待办、最新信箱留言、随机较早感受回声、今日触发浮现。每区附带验真字段。每次新对话开始时先调这个，再做其他操作。"""
     return await _with_notice(
