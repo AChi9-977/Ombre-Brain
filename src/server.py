@@ -857,7 +857,7 @@ async def timeline(
     )
 
 
-@mcp_extra.tool()
+@mcp.tool()
 async def archive_session(
     summary: str,
     highlights: Optional[str] = "",
